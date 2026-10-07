@@ -1292,13 +1292,18 @@ purge_now() {
     fi
     sync
     echo 1 > /proc/sys/kernel/sysrq
+    exec 3>/proc/sysrq-trigger
+    cleanup
+    trap - EXIT
     if btrfs subvolume delete --recursive "$TOP/$rootsub" >/dev/null 2>&1; then
-        printf '==> The old system is deleted. Rebooting into FasdeqOS in 10 seconds (Ctrl+C to cancel).\n'
+        printf '==> The old system is deleted. Rebooting into FasdeqOS in 10 seconds.\n'
         read -r -t 10 _ || true
-        echo s > /proc/sysrq-trigger
-        echo u > /proc/sysrq-trigger
-        echo b > /proc/sysrq-trigger
+        echo s >&3
+        echo u >&3
+        echo b >&3
+        read -r _ || true
     else
+        exec 3>&-
         say "The running system cannot be deleted while it is in use. It is removed after the first boot."
     fi
 }
