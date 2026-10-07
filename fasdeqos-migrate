@@ -1,7 +1,16 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-PAYLOAD_URL=${FASDEQOS_PAYLOAD_URL:-__PAYLOAD_URL__}
+# Where the payload comes from (first match wins):
+#   1. --payload FILE|URL            or  FASDEQOS_PAYLOAD=FILE|URL
+#   2. fasdeqos-payload.tar.zst next to this script, or in ./out/ next to it
+#   3. FASDEQOS_PAYLOAD_URL (default: raw file in the GitHub repo)
+DEFAULT_PAYLOAD_URL=https://raw.githubusercontent.com/Fasdeq13/fasdeqOS/main/fasdeqos-payload.tar.zst
+PAYLOAD_URL=${FASDEQOS_PAYLOAD_URL:-$DEFAULT_PAYLOAD_URL}
+PAYLOAD_SRC=${FASDEQOS_PAYLOAD:-}
+PAYLOAD=""
+PAYLOAD_TMP=0
+SELF_DIR=$(dirname "$(readlink -f "$0")")
 TOP=/run/fasdeqos-top
 VOLUMES="root System Applications Library Users private"
 GNU_PKGS="coreutils grep sed findutils gawk diffutils gzip tar which"
@@ -16,6 +25,13 @@ die() {
 say() {
     printf '==> %s\n' "$1"
 }
+
+cleanup() {
+    if [ "$PAYLOAD_TMP" -eq 1 ] && [ -n "$PAYLOAD" ]; then
+        rm -f "$PAYLOAD"
+    fi
+}
+trap cleanup EXIT
 
 bundle_name() {
     case $1 in
@@ -71,6 +87,45 @@ check_system() {
     [ -n "${ESP:-}" ] || die "The EFI system partition was not found. UEFI is required."
 }
 
+# Finds or downloads the payload BEFORE anything is changed on the system.
+resolve_payload() {
+    local c
+    if [ -z "$PAYLOAD_SRC" ]; then
+        for c in "$SELF_DIR/fasdeqos-payload.tar.zst" "$SELF_DIR/out/fasdeqos-payload.tar.zst" "$PWD/fasdeqos-payload.tar.zst"; do
+            if [ -f "$c" ]; then
+                PAYLOAD_SRC=$c
+                break
+            fi
+        done
+    fi
+    case $PAYLOAD_SRC in
+        http://*|https://*)
+            PAYLOAD_URL=$PAYLOAD_SRC
+            PAYLOAD_SRC="" ;;
+    esac
+    if [ -n "$PAYLOAD_SRC" ]; then
+        [ -f "$PAYLOAD_SRC" ] || die "Payload file not found: $PAYLOAD_SRC"
+        PAYLOAD=$(readlink -f "$PAYLOAD_SRC")
+        say "Using local payload: $PAYLOAD"
+    else
+        command -v curl >/dev/null || die "curl is required to download the payload."
+        PAYLOAD=$(mktemp /tmp/fasdeqos-payload.XXXXXX)
+        PAYLOAD_TMP=1
+        say "Downloading payload: $PAYLOAD_URL"
+        if ! curl -fsSL "$PAYLOAD_URL" -o "$PAYLOAD"; then
+            die "Could not download the payload from $PAYLOAD_URL
+       Build it with build.sh (it creates out/fasdeqos-payload.tar.zst) and either:
+         - put the file next to this script, or
+         - run: sudo ./fasdeqos-migrate --payload /path/to/fasdeqos-payload.tar.zst
+         - or upload it to a GitHub release and set FASDEQOS_PAYLOAD_URL."
+        fi
+    fi
+    [ -s "$PAYLOAD" ] || die "The payload file is empty: $PAYLOAD"
+    if command -v zstd >/dev/null; then
+        zstd -tq "$PAYLOAD" || die "The payload is not a valid .zst archive: $PAYLOAD"
+    fi
+}
+
 choose_mode() {
     local answer
     if [ -n "$MODE" ]; then
@@ -103,11 +158,7 @@ prepare() {
     if [ "$MODE" = clean ] && [ "$(findmnt -no TARGET -T /boot)" = "/" ]; then
         die "/boot is part of the root filesystem. Use --backup, or move /boot to the EFI partition first."
     fi
-    case $PAYLOAD_URL in
-        __PAYLOAD_URL__) die "The payload URL is not set. Export FASDEQOS_PAYLOAD_URL." ;;
-    esac
-    PAYLOAD=$(mktemp /tmp/fasdeqos-payload.XXXXXX)
-    curl -fsSL "$PAYLOAD_URL" -o "$PAYLOAD"
+    bsdtar -tf "$PAYLOAD" ./usr/bin/pkg >/dev/null 2>&1 || die "The payload does not look like a FasdeqOS payload (./usr/bin/pkg is missing)."
 }
 
 make_volumes() {
@@ -346,16 +397,23 @@ finish() {
     fi
 }
 
-for arg in "$@"; do
-    case $arg in
+while [ $# -gt 0 ]; do
+    case $1 in
         --backup) MODE=backup ;;
         --no-backup) MODE=clean ;;
         --yes) ASSUME_YES=1 ;;
-        *) die "Unknown option: $arg" ;;
+        --payload)
+            [ $# -ge 2 ] || die "--payload needs a file path or URL."
+            PAYLOAD_SRC=$2
+            shift ;;
+        --payload=*) PAYLOAD_SRC=${1#--payload=} ;;
+        *) die "Unknown option: $1" ;;
     esac
+    shift
 done
 
 check_system
+resolve_payload
 choose_mode
 confirm
 prepare
