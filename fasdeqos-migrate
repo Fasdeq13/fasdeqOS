@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Where the payload comes from (first match wins):
-#   1. --payload FILE|URL            or  FASDEQOS_PAYLOAD=FILE|URL
-#   2. fasdeqos-payload.tar.zst next to this script, or in ./out/ next to it
-#   3. FASDEQOS_PAYLOAD_URL (default: raw file in the GitHub repo)
 DEFAULT_PAYLOAD_URL=https://raw.githubusercontent.com/Fasdeq13/fasdeqOS/main/fasdeqos-payload.tar.zst
 PAYLOAD_URL=${FASDEQOS_PAYLOAD_URL:-$DEFAULT_PAYLOAD_URL}
 PAYLOAD_SRC=${FASDEQOS_PAYLOAD:-}
@@ -14,9 +10,34 @@ SELF_DIR=$(dirname "$(readlink -f "$0")")
 TOP=/run/fasdeqos-top
 VOLUMES="root System Applications Library Users private"
 GNU_PKGS="coreutils grep sed findutils gawk diffutils gzip tar which"
+COMPAT_PKGS=${FASDEQOS_COMPAT:-"steam davinci-resolve davinci-resolve-studio"}
+SNAPDIR=.fasdeqos-snapshots
+SNAPNAME=initial
 MODE=""
+SEAL=""
+USERLAND=""
 ASSUME_YES=0
 RESUME=0
+EXPERIMENTAL=0
+WINDOWS=0
+LOADERS=""
+WIN_FILE=""
+WIN_UUID=""
+WIN_PARTUUID=""
+GRUB_CFG=""
+LIMINE_CONF=""
+SDB_ROOT=""
+TOOLS_TMP=""
+INITRAMFS=""
+KVER=""
+CMDLINE=""
+SNAPCMDLINE=""
+ESP=""
+ESP_DEV=""
+ESP_PARTUUID=""
+DEV=""
+UUID=""
+ESP_UUID=""
 
 die() {
     printf 'Error: %s\n' "$1" >&2
@@ -31,8 +52,21 @@ cleanup() {
     if [ "$PAYLOAD_TMP" -eq 1 ] && [ -n "$PAYLOAD" ]; then
         rm -f "$PAYLOAD"
     fi
+    if [ -n "$TOOLS_TMP" ]; then
+        rm -rf "$TOOLS_TMP"
+    fi
+    if [ -n "$INITRAMFS" ]; then
+        rm -f "$INITRAMFS"
+    fi
 }
 trap cleanup EXIT
+
+in_list() {
+    case " $2 " in
+        *" $1 "*) return 0 ;;
+    esac
+    return 1
+}
 
 bundle_name() {
     case $1 in
@@ -65,20 +99,462 @@ fix_shebangs() {
     done
 }
 
+tool_union() {
+    cat <<'UNION'
+#!/usr/bin/env sh
+mode=${1:-rebuild}
+union_one() {
+    target=$1
+    base=$2
+    sub=$3
+    [ -d "$base" ] || return 0
+    opts="lowerdir+=$base"
+    count=0
+    for b in /Applications/*.pkg; do
+        if [ -d "$b/$sub" ]; then
+            opts="$opts,lowerdir+=$b/$sub"
+            count=$((count + 1))
+        fi
+    done
+    [ "$count" -gt 0 ] || return 0
+    mount -t overlay overlay -o "$opts" "$target"
+}
+if [ "$mode" = boot ] && [ "$(findmnt -no FSTYPE /usr)" = overlay ]; then
+    exit 0
+fi
+while [ "$(findmnt -no FSTYPE /usr)" = overlay ]; do
+    umount -l /usr || break
+done
+while [ "$(findmnt -no FSTYPE /opt 2>/dev/null)" = overlay ]; do
+    umount -l /opt || break
+done
+union_one /usr /System usr
+union_one /opt /System/opt opt
+ldconfig 2>/dev/null
+exit 0
+UNION
+}
+
+tool_compat() {
+    cat <<'COMPAT'
+#!/usr/bin/env sh
+APPS=${FASDEQOS_APPS:-/Applications}
+LIB=${FASDEQOS_LIB:-/Library}
+RUNAPPS=/Applications
+name=$1
+b=$APPS/$name.pkg
+if [ -z "$name" ] || [ ! -d "$b" ]; then
+    echo "Usage: fasdeqos-compat <Bundle>" >&2
+    exit 1
+fi
+if [ ! -d "$LIB/gnu-userland" ]; then
+    echo "The GNU userland store is missing: $LIB/gnu-userland" >&2
+    exit 1
+fi
+if [ ! -d "$b/gnu" ]; then
+    mkdir -p "$b/gnu"
+    cp -a "$LIB/gnu-userland/." "$b/gnu/"
+fi
+line="FASDEQOS_COMPAT=1; PATH=$RUNAPPS/$name.pkg/gnu/bin:\$PATH; export PATH FASDEQOS_COMPAT"
+for f in "$b"/usr/bin/*; do
+    if [ ! -f "$f" ] || [ -L "$f" ]; then
+        continue
+    fi
+    first=$(head -n1 "$f")
+    case $first in
+        *fish*) continue ;;
+        "#!"*sh*|"#!"*bash*) ;;
+        *) continue ;;
+    esac
+    if grep -q 'FASDEQOS_COMPAT=1' "$f"; then
+        continue
+    fi
+    { printf '%s\n' "$first"; printf '%s\n' "$line"; tail -n +2 "$f"; } > "$f.fix"
+    cat "$f.fix" > "$f"
+    rm -f "$f.fix"
+done
+for d in "$b"/usr/share/applications/*.desktop; do
+    if [ ! -f "$d" ]; then
+        continue
+    fi
+    if grep -q 'FASDEQOS_GNU=1' "$d"; then
+        continue
+    fi
+    sed "s|^Exec=|Exec=env PATH=$RUNAPPS/$name.pkg/gnu/bin:/usr/bin:/bin FASDEQOS_GNU=1 |" "$d" > "$d.fix"
+    cat "$d.fix" > "$d"
+    rm -f "$d.fix"
+done
+exit 0
+COMPAT
+}
+
+tool_libcheck() {
+    cat <<'LIBCHECK'
+#!/usr/bin/env sh
+APPS=${FASDEQOS_APPS:-/Applications}
+name=$1
+b=$APPS/$name.pkg
+[ -d "$b" ] || exit 1
+lp=""
+for d in "$b/usr/lib" "$b/usr/lib32" "$b/usr/lib64" "$b"/opt/*/lib "$b"/opt/*/bin; do
+    if [ -d "$d" ]; then
+        lp="$lp:$d"
+    fi
+done
+status=0
+for f in "$b"/usr/bin/* "$b"/opt/*/bin/*; do
+    if [ ! -f "$f" ]; then
+        continue
+    fi
+    if ! head -c4 "$f" 2>/dev/null | grep -q ELF; then
+        continue
+    fi
+    missing=$(LD_LIBRARY_PATH="${lp#:}:/usr/lib" ldd "$f" 2>/dev/null | grep 'not found' || true)
+    if [ -n "$missing" ]; then
+        printf '%s is missing libraries:\n%s\n' "$f" "$missing" >&2
+        status=1
+    fi
+done
+exit $status
+LIBCHECK
+}
+
+tool_lock() {
+    cat <<'LOCK'
+#!/usr/bin/env sh
+mode=ro
+case $(basename "$0") in
+    *unlock*) mode=rw ;;
+esac
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+findmnt -rn -t btrfs -o TARGET,SOURCE | while read -r t s; do
+    case $s in
+        *"[/System"*) mount -o "remount,bind,$mode" "$t" ;;
+    esac
+done
+echo "System volume is now $mode."
+exit 0
+LOCK
+}
+
+tool_pkg() {
+    cat <<'PKGW'
+#!/usr/bin/env sh
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+bundle_name() {
+    case $1 in
+        vlc) echo VLC ;;
+        gimp) echo GIMP ;;
+        libreoffice-fresh) echo LibreOffice ;;
+        telegram-desktop) echo Telegram ;;
+        nautilus) echo Files ;;
+        gnome-console) echo Console ;;
+        gnome-text-editor) echo TextEditor ;;
+        *)
+            first=$(printf '%s' "$1" | cut -c1 | tr a-z A-Z)
+            rest=$(printf '%s' "$1" | cut -c2-)
+            echo "$first$rest" ;;
+    esac
+}
+cmd=${1:-}
+case $cmd in
+    union)
+        /usr/bin/sh /usr/bin/fasdeqos-union
+        exit 0 ;;
+    compat)
+        shift
+        for p in "$@"; do
+            /usr/bin/sh /usr/bin/fasdeqos-compat "$(bundle_name "$p")"
+        done
+        /usr/bin/sh /usr/bin/fasdeqos-union
+        exit 0 ;;
+    check)
+        shift
+        for p in "$@"; do
+            /usr/bin/sh /usr/bin/fasdeqos-libcheck "$(bundle_name "$p")"
+        done
+        exit 0 ;;
+esac
+PKG_NO_UNION=1 /usr/bin/pkg-real "$@"
+rc=$?
+case $cmd in
+    install|uninstall|remove|rm|upgrade)
+        shift
+        for p in "$@"; do
+            case $p in
+                -*) continue ;;
+            esac
+            name=$(bundle_name "$p")
+            if [ "$cmd" = install ] && [ -d "/Applications/$name.pkg" ]; then
+                if grep -qx "$p" /Library/compat.list 2>/dev/null; then
+                    /usr/bin/sh /usr/bin/fasdeqos-compat "$name"
+                fi
+            fi
+        done
+        /usr/bin/sh /usr/bin/fasdeqos-union
+        if [ "$cmd" = install ] || [ "$cmd" = upgrade ]; then
+            for p in "$@"; do
+                case $p in
+                    -*) continue ;;
+                esac
+                /usr/bin/sh /usr/bin/fasdeqos-libcheck "$(bundle_name "$p")" || true
+            done
+        fi ;;
+esac
+exit $rc
+PKGW
+}
+
+tool_hook() {
+    cat <<'HOOK'
+run_hook() {
+    mount_handler=fasdeqos_disk_mount_handler
+}
+
+fasdeqos_disk_mount_handler() {
+    newroot=$1
+    dev=/dev/disk/by-uuid/${root#UUID=}
+    pre=${fasdeqos_snap:-}
+    waited=0
+    while [ ! -b "$dev" ] && [ "$waited" -lt 30 ]; do
+        udevadm settle --timeout=1
+        sleep 1
+        waited=$((waited + 1))
+    done
+    btrfs device scan
+    opts=compress=zstd:1,noatime
+    mount -t btrfs -o "$opts,subvol=${pre}root" "$dev" "$newroot" || echo "fasdeqos: mount root failed"
+    for v in System Applications Library Users private; do
+        mount -t btrfs -o "$opts,subvol=${pre}$v" "$dev" "$newroot/$v" || echo "fasdeqos: mount $v failed"
+    done
+    if [ -n "$fasdeqos_esp" ]; then
+        mkdir -p "$newroot/System/Boot" 2>/dev/null
+        mount -t vfat "/dev/disk/by-uuid/$fasdeqos_esp" "$newroot/System/Boot" || echo "fasdeqos: ESP mount failed"
+    fi
+    klog() {
+        echo "fasdeqos: $*" > /dev/kmsg 2>/dev/null
+        echo "fasdeqos: $*"
+    }
+    modprobe overlay 2>/dev/null
+    plus="lowerdir+=$newroot/System"
+    classic="$newroot/System"
+    count=0
+    for b in "$newroot"/Applications/*.pkg; do
+        if [ -d "$b/usr" ]; then
+            plus="$plus,lowerdir+=$b/usr"
+            classic="$classic:$b/usr"
+            count=$((count + 1))
+        fi
+    done
+    ok=0
+    if [ "$count" -gt 0 ]; then
+        if out=$(mount -t overlay overlay -o "$plus" "$newroot/usr" 2>&1); then
+            ok=1
+            klog "overlay mounted"
+        elif out2=$(mount -t overlay overlay -o "lowerdir=$classic" "$newroot/usr" 2>&1); then
+            ok=1
+            klog "overlay mounted (classic)"
+        else
+            klog "overlay failed: $out / $out2"
+        fi
+    fi
+    if [ "$ok" -eq 0 ]; then
+        mount --bind "$newroot/System" "$newroot/usr" || klog "bind /usr failed"
+    fi
+    if [ ! -e "$newroot/usr/lib/ld-linux-x86-64.so.2" ]; then
+        klog "ld.so missing after mount, using plain /System"
+        umount "$newroot/usr" 2>/dev/null
+        mount --bind "$newroot/System" "$newroot/usr" || klog "bind /usr failed"
+    fi
+    for m in "usr/lib lib" "usr/lib lib64" "private/etc etc" "private/var var" "private/tmp tmp"; do
+        set -- $m
+        mount --bind "$newroot/$1" "$newroot/$2" || klog "bind $1 to $2 failed"
+    done
+    if [ -d "$newroot/usr/opt" ]; then
+        mkdir -p "$newroot/opt"
+        mount --bind "$newroot/usr/opt" "$newroot/opt"
+    fi
+    echo /usr/bin/modprobe > /proc/sys/kernel/modprobe
+    mkdir -p "$newroot/bin"
+    for n in sh bash env login; do
+        if [ -e "$newroot/usr/bin/$n" ]; then
+            : > "$newroot/bin/$n"
+            mount --bind "$newroot/usr/bin/$n" "$newroot/bin/$n"
+        fi
+    done
+    if [ "${fasdeqos_sealed:-0}" = 1 ]; then
+        for t in System usr lib lib64 opt bin/sh bin/bash bin/env bin/login; do
+            if [ -e "$newroot/$t" ]; then
+                mount -o remount,bind,ro "$newroot/$t" 2>/dev/null
+            fi
+        done
+        klog "system volume sealed (read-only)"
+    fi
+}
+HOOK
+}
+
+write_initcpio() {
+    say "Writing the initramfs hook"
+    mkdir -p /etc/initcpio/hooks /etc/initcpio/install
+    cat > /etc/initcpio/install/fasdeqos-disk <<'INSTALL'
+build() {
+    add_module btrfs
+    add_module vfat
+    add_module overlay
+    add_binary btrfs
+    add_runscript
+}
+INSTALL
+    tool_hook > /etc/initcpio/hooks/fasdeqos-disk
+}
+
+write_os_release() {
+    cat > "$TOP/System/lib/os-release" <<'OSREL'
+NAME="fasdeqOS"
+PRETTY_NAME="fasdeqOS"
+ID=fasdeqos
+ID_LIKE=fasdeq
+BUILD_ID=rolling
+ANSI_COLOR="38;2;23;147;209"
+HOME_URL="https://fasdeq13.github.io/fasdeq-os/"
+DOCUMENTATION_URL="https://fasdeq13.github.io/fasdeq-os/#overview"
+SUPPORT_URL="https://fasdeq13.github.io/fasdeq-os/"
+BUG_REPORT_URL="https://github.com/Fasdeq13/fasdeqOS/pulls"
+LOGO=fasdeqos-logo
+OSREL
+    rm -f "$TOP/private/etc/os-release"
+    ln -s ../usr/lib/os-release "$TOP/private/etc/os-release"
+}
+
+write_tools() {
+    local bin=$TOP/System/bin priv=$TOP/private p
+    say "Installing FasdeqOS tools"
+    if [ -e "$bin/pkg" ] && [ ! -e "$bin/pkg-real" ]; then
+        mv "$bin/pkg" "$bin/pkg-real"
+    fi
+    tool_pkg > "$bin/pkg"
+    tool_union > "$bin/fasdeqos-union"
+    tool_compat > "$bin/fasdeqos-compat"
+    tool_libcheck > "$bin/fasdeqos-libcheck"
+    tool_lock > "$bin/fasdeqos-lock"
+    tool_lock > "$bin/fasdeqos-unlock"
+    chmod +x "$bin/pkg" "$bin/pkg-real" "$bin/fasdeqos-union" "$bin/fasdeqos-compat" "$bin/fasdeqos-libcheck" "$bin/fasdeqos-lock" "$bin/fasdeqos-unlock"
+    : > "$TOP/Library/compat.list"
+    for p in $COMPAT_PKGS; do
+        printf '%s\n' "$p" >> "$TOP/Library/compat.list"
+    done
+    mkdir -p "$priv/etc/systemd/system/sysinit.target.wants"
+    cat > "$priv/etc/systemd/system/fasdeqos-union.service" <<'UNIT'
+[Unit]
+Description=Merge application bundles into /usr
+DefaultDependencies=no
+After=local-fs-pre.target
+Before=sysinit.target basic.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/bin/sh /usr/bin/fasdeqos-union boot
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+    ln -sf /etc/systemd/system/fasdeqos-union.service "$priv/etc/systemd/system/sysinit.target.wants/fasdeqos-union.service"
+}
+
+find_grub_cfg() {
+    local c
+    if [ ! -d /etc/grub.d ] || ! command -v grub-mkconfig >/dev/null; then
+        return 1
+    fi
+    for c in /boot/grub/grub.cfg /boot/grub2/grub.cfg /efi/grub/grub.cfg /boot/efi/grub/grub.cfg; do
+        if [ -f "$c" ]; then
+            GRUB_CFG=$c
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_limine_conf() {
+    local c
+    for c in "$ESP/limine.conf" "$ESP/EFI/limine/limine.conf" "$ESP/EFI/BOOT/limine.conf" /boot/limine/limine.conf /boot/limine.conf "$ESP/limine/limine.conf" "$ESP/limine.cfg" "$ESP/EFI/limine/limine.cfg" "$ESP/EFI/BOOT/limine.cfg" /boot/limine/limine.cfg /boot/limine.cfg; do
+        if [ -f "$c" ]; then
+            LIMINE_CONF=$c
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_sdboot_root() {
+    local d
+    for d in "$ESP" /boot /efi /boot/efi; do
+        if [ -f "$d/loader/loader.conf" ] && [ -e "$d/EFI/systemd/systemd-bootx64.efi" ]; then
+            SDB_ROOT=$d
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_windows() {
+    local dev fs m tmp found
+    while read -r dev fs; do
+        if [ "$fs" != vfat ]; then
+            continue
+        fi
+        m=$(findmnt -rno TARGET "$dev" 2>/dev/null | head -n1 || true)
+        tmp=""
+        if [ -z "$m" ]; then
+            tmp=$(mktemp -d /tmp/fasdeqos-win.XXXXXX)
+            if mount -o ro "$dev" "$tmp" 2>/dev/null; then
+                m=$tmp
+            else
+                rmdir "$tmp"
+                continue
+            fi
+        fi
+        found=$(find "$m/EFI" -maxdepth 3 -iname bootmgfw.efi 2>/dev/null | head -n1 || true)
+        if [ -n "$found" ]; then
+            WIN_FILE=${found#"$m"}
+            WIN_UUID=$(blkid -s UUID -o value "$dev")
+            WIN_PARTUUID=$(blkid -s PARTUUID -o value "$dev")
+            WINDOWS=1
+        fi
+        if [ -n "$tmp" ]; then
+            umount "$tmp"
+            rmdir "$tmp"
+        fi
+        if [ "$WINDOWS" -eq 1 ]; then
+            return 0
+        fi
+    done < <(lsblk -rno PATH,FSTYPE)
+    return 0
+}
+
 check_system() {
     [ "$(id -u)" -eq 0 ] || die "Run this script as root."
+    command -v pacman >/dev/null || die "pacman is required."
     . /etc/os-release
-    case " ${ID:-} ${ID_LIKE:-} " in
-        *" arch "*|*" manjaro "*|*" cachyos "*) ;;
-        *) die "This is not an Arch-based system (Arch, Manjaro or CachyOS)." ;;
+    case ${ID:-} in
+        arch|manjaro|cachyos|garuda|omarchy) ;;
+        *) die "Supported systems: Arch, Manjaro, CachyOS and Garuda (Omarchy is experimental)." ;;
     esac
+    if [ "${ID:-}" = omarchy ] || [ -d /usr/share/omarchy ] || compgen -G "/home/*/.local/share/omarchy" >/dev/null; then
+        EXPERIMENTAL=1
+    fi
     [ "$(findmnt -no FSTYPE /)" = btrfs ] || die "The root filesystem is not btrfs."
     DEV=$(findmnt -no SOURCE / | sed 's/\[.*//')
     case $DEV in
         /dev/mapper/*) die "Encrypted and LVM root filesystems are not supported." ;;
     esac
     [ ! -d /System ] || die "The FasdeqOS layout already exists."
-    command -v pacman >/dev/null || die "pacman is required."
     for t in /boot/efi /efi /boot; do
         if [ "$(findmnt -no FSTYPE "$t" 2>/dev/null || true)" = vfat ]; then
             ESP=$t
@@ -86,9 +562,21 @@ check_system() {
         fi
     done
     [ -n "${ESP:-}" ] || die "The EFI system partition was not found. UEFI is required."
+    ESP_DEV=$(findmnt -no SOURCE "$ESP")
+    ESP_PARTUUID=$(blkid -s PARTUUID -o value "$ESP_DEV" || true)
+    if find_grub_cfg; then
+        LOADERS="$LOADERS grub"
+    fi
+    if find_limine_conf; then
+        LOADERS="$LOADERS limine"
+    fi
+    if find_sdboot_root; then
+        LOADERS="$LOADERS systemd-boot"
+    fi
+    [ -n "$LOADERS" ] || die "Supported boot loaders: GRUB, Limine and systemd-boot."
+    find_windows
 }
 
-# Finds or downloads the payload BEFORE anything is changed on the system.
 resolve_payload() {
     local c
     if [ -z "$PAYLOAD_SRC" ]; then
@@ -115,10 +603,8 @@ resolve_payload() {
         say "Downloading payload: $PAYLOAD_URL"
         if ! curl -fsSL "$PAYLOAD_URL" -o "$PAYLOAD"; then
             die "Could not download the payload from $PAYLOAD_URL
-       Build it with build.sh (it creates out/fasdeqos-payload.tar.zst) and either:
-         - put the file next to this script, or
-         - run: sudo ./fasdeqos-migrate --payload /path/to/fasdeqos-payload.tar.zst
-         - or upload it to a GitHub release and set FASDEQOS_PAYLOAD_URL."
+       Put fasdeqos-payload.tar.zst next to this script or run:
+       sudo ./fasdeqos-migrate --payload /path/to/fasdeqos-payload.tar.zst"
         fi
     fi
     [ -s "$PAYLOAD" ] || die "The payload file is empty: $PAYLOAD"
@@ -129,22 +615,61 @@ resolve_payload() {
 
 choose_mode() {
     local answer
-    if [ -n "$MODE" ]; then
-        return 0
+    if [ "$ASSUME_YES" -eq 1 ]; then
+        MODE=${MODE:-backup}
+        USERLAND=${USERLAND:-chimerautils}
+        SEAL=${SEAL:-open}
     fi
-    printf '\n1) Without backup (recommended)\n   Everything moves into the FasdeqOS layout. GNU utilities are replaced by chimerautils.\n   The old system is deleted after the first successful boot.\n\n2) With backup\n   Everything is copied into the FasdeqOS layout. The old system stays untouched.\n\n'
-    read -rp "Choose 1 or 2: " answer
-    case $answer in
-        1) MODE=clean ;;
-        2) MODE=backup ;;
-        *) die "Invalid choice." ;;
-    esac
+    if [ -z "$MODE" ]; then
+        printf '\n1) Without backup (recommended)\n   Everything moves into the FasdeqOS layout and the old system is deleted right away.\n   A "FasdeqOS snapshot" boot entry stays as a fallback.\n\n2) With backup\n   Everything is copied into the FasdeqOS layout. The old system stays untouched.\n\n'
+        read -rp "Choose 1 or 2: " answer
+        case $answer in
+            1) MODE=clean ;;
+            2) MODE=backup ;;
+            *) die "Invalid choice." ;;
+        esac
+    fi
+    if [ "$MODE" = clean ] && [ -z "$USERLAND" ]; then
+        printf '\nBase utilities that replace GNU:\n\n1) chimerautils (BSD userland)\n2) busybox\n\n'
+        read -rp "Choose 1 or 2: " answer
+        case $answer in
+            1) USERLAND=chimerautils ;;
+            2) USERLAND=busybox ;;
+            *) die "Invalid choice." ;;
+        esac
+    fi
+    if [ -z "$SEAL" ]; then
+        printf '\nSystem volume (/System):\n\n1) Open: read-write, you can change anything\n2) Sealed: read-only, run fasdeqos-unlock to change it temporarily\n\n'
+        read -rp "Choose 1 or 2: " answer
+        case $answer in
+            1) SEAL=open ;;
+            2) SEAL=sealed ;;
+            *) die "Invalid choice." ;;
+        esac
+    fi
 }
 
 confirm() {
     local answer
+    printf '\nBoot loaders to edit:%s\n' "$LOADERS"
+    if [ "$WINDOWS" -eq 1 ]; then
+        printf 'Windows Boot Manager found: yes (dual boot)\n'
+    else
+        printf 'Windows Boot Manager found: no\n'
+    fi
+    if [ "$EXPERIMENTAL" -eq 1 ]; then
+        printf '\nOmarchy support is EXPERIMENTAL.\n'
+        if [ "$ASSUME_YES" -ne 1 ]; then
+            printf 'Type EXPERIMENTAL to continue: '
+            read -r answer
+            [ "$answer" = EXPERIMENTAL ] || die "Cancelled."
+        fi
+    fi
     if [ "$ASSUME_YES" -eq 1 ]; then
         return 0
+    fi
+    if [ "$MODE" = clean ]; then
+        printf '\nThe old system will be deleted and the computer will reboot into FasdeqOS.\n'
     fi
     printf '\nThis changes the layout of your disk. Type MIGRATE to continue: '
     read -r answer
@@ -152,10 +677,14 @@ confirm() {
 }
 
 prepare() {
+    local extra=""
     say "Installing required packages"
-    pacman -S --needed --noconfirm fish libarchive zstd mkinitcpio btrfs-progs curl
+    if [ "$USERLAND" = busybox ]; then
+        extra=busybox
+    fi
+    pacman -S --needed --noconfirm fish libarchive zstd mkinitcpio btrfs-progs curl pacman-contrib util-linux $extra
     UUID=$(blkid -s UUID -o value "$DEV")
-    ESP_UUID=$(blkid -s UUID -o value "$(findmnt -no SOURCE "$ESP")")
+    ESP_UUID=$(blkid -s UUID -o value "$ESP_DEV")
     if [ "$MODE" = clean ] && [ "$(findmnt -no TARGET -T /boot)" = "/" ]; then
         die "/boot is part of the root filesystem. Use --backup, or move /boot to the EFI partition first."
     fi
@@ -178,10 +707,9 @@ make_volumes() {
         done
         return 0
     fi
-    # Volumes from an interrupted run: resume only if the file stage had finished.
     if [ "$have" -eq 6 ] && [ -f "$TOP/root/.hidden" ] && [ -x "$TOP/System/bin/pkg" ] && [ -e "$TOP/private/etc/fstab" ]; then
         RESUME=1
-        say "Volumes and files already prepared, skipping to the boot entry"
+        say "Volumes and files already prepared, skipping to the boot entries"
         return 0
     fi
     die "Incomplete FasdeqOS volumes found on the btrfs top level. Delete them first:
@@ -197,6 +725,7 @@ copy_files() {
     local d
     say "Copying files into the new layout"
     clone /usr "$TOP/System"
+    mkdir -p "$TOP/System/Boot" "$TOP/System/opt"
     clone /etc "$TOP/private/etc"
     clone /var "$TOP/private/var"
     clone /root "$TOP/private/var/root"
@@ -211,6 +740,23 @@ copy_files() {
     chmod 1777 "$TOP/private/tmp"
     for d in System Applications Library Users private Volumes usr lib lib64 etc var tmp; do
         mkdir -p "$TOP/root/$d"
+    done
+}
+
+save_gnu() {
+    local p f dst=$TOP/Library/gnu-userland
+    say "Saving the GNU userland for compatibility bundles"
+    mkdir -p "$dst/bin"
+    for p in $GNU_PKGS bash; do
+        pacman -Qq "$p" >/dev/null 2>&1 || continue
+        while IFS= read -r f; do
+            case $f in
+                /usr/bin/?*)
+                    if [ -f "$f" ] || [ -L "$f" ]; then
+                        cp -a "$f" "$dst/bin/"
+                    fi ;;
+            esac
+        done < <(pacman -Qlq "$p")
     done
 }
 
@@ -232,41 +778,109 @@ remove_gnu() {
     done
 }
 
+eligible() {
+    local p=$1 files=$2
+    if ! grep -q '^/usr/share/applications/.*\.desktop$' <<< "$files"; then
+        return 1
+    fi
+    if grep -q '^/\(etc\|boot\)/' <<< "$files"; then
+        return 1
+    fi
+    if grep -q '^/opt/' <<< "$files" && ! in_list "$p" "$COMPAT_PKGS"; then
+        return 1
+    fi
+    return 0
+}
+
+dep_movable() {
+    local files
+    files=$(pacman -Qlq "$1" 2>/dev/null || true)
+    if ! grep -q '^/usr/' <<< "$files"; then
+        return 1
+    fi
+    if grep -q '^/\(etc\|boot\|var\|opt\)/' <<< "$files"; then
+        return 1
+    fi
+    return 0
+}
+
+exclusive_deps() {
+    local p=$1 closure d x ok
+    closure=$(pactree -u "$p" 2>/dev/null | sort -u || true)
+    for d in $closure; do
+        if [ "$d" = "$p" ]; then
+            continue
+        fi
+        ok=1
+        for x in $(pactree -u -r "$d" 2>/dev/null); do
+            if ! grep -qx "$x" <<< "$closure"; then
+                ok=0
+                break
+            fi
+        done
+        if [ "$ok" -eq 1 ]; then
+            echo "$d"
+        fi
+    done
+}
+
+move_pkg_files() {
+    local b=$1 p=$2 f rel src dst ver files
+    files=$(pacman -Qlq "$p")
+    while IFS= read -r f; do
+        case $f in
+            /usr/*)
+                rel=${f#/usr/}
+                src=$TOP/System/$rel
+                dst=$b/usr/$rel ;;
+            /opt/*)
+                rel=${f#/opt/}
+                src=$TOP/System/opt/$rel
+                dst=$b/opt/$rel ;;
+            *) continue ;;
+        esac
+        if [ -d "$src" ] && [ ! -L "$src" ]; then
+            mkdir -p "$dst"
+        elif [ -e "$src" ] || [ -L "$src" ]; then
+            mkdir -p "$(dirname "$dst")"
+            cp -a --reflink=auto "$src" "$dst"
+            rm -f "$src"
+        fi
+    done <<< "$files"
+    ver=$(pacman -Q "$p" | cut -d' ' -f2)
+    if [ -d "$TOP/private/var/lib/pacman/local/$p-$ver" ]; then
+        mv "$TOP/private/var/lib/pacman/local/$p-$ver" "$b/.db/own/"
+    fi
+}
+
 bundle_apps() {
-    local p name b ver f rel files uidgid
+    local p name b d names uidgid files
     say "Moving applications and games into /Applications"
     uidgid=$(awk -F: '$3 >= 1000 && $3 < 60000 {print $3 ":" $4; exit}' /etc/passwd)
     uidgid=${uidgid:-0:0}
+    TOOLS_TMP=$(mktemp -d /tmp/fasdeqos-tools.XXXXXX)
+    tool_compat > "$TOOLS_TMP/compat.sh"
     for p in $(pacman -Qqet); do
         case $p in
-            fish|sudo|networkmanager|grub|mkinitcpio) continue ;;
+            fish|sudo|networkmanager|grub|mkinitcpio|busybox|pacman-contrib) continue ;;
         esac
         files=$(pacman -Qlq "$p")
-        if ! grep -q '^/usr/share/applications/.*\.desktop$' <<< "$files"; then
-            continue
-        fi
-        if grep -q '^/\(opt\|etc\|boot\)/' <<< "$files"; then
-            continue
-        fi
+        eligible "$p" "$files" || continue
         name=$(bundle_name "$p")
         b=$TOP/Applications/$name.pkg
-        ver=$(pacman -Q "$p" | cut -d' ' -f2)
         mkdir -p "$b/.db/own"
-        while IFS= read -r f; do
-            case $f in
-                /usr/*)
-                    rel=${f#/usr/}
-                    if [ -d "$TOP/System/$rel" ] && [ ! -L "$TOP/System/$rel" ]; then
-                        mkdir -p "$b/usr/$rel"
-                    elif [ -e "$TOP/System/$rel" ] || [ -L "$TOP/System/$rel" ]; then
-                        mkdir -p "$b/usr/$(dirname "$rel")"
-                        cp -a --reflink=auto "$TOP/System/$rel" "$b/usr/$rel"
-                        rm -f "$TOP/System/$rel"
-                    fi ;;
-            esac
-        done <<< "$files"
-        mv "$TOP/private/var/lib/pacman/local/$p-$ver" "$b/.db/own/"
-        printf 'bundle=%s\nrequested=%s\npackages=%s\nstate=installed\n' "$name" "$p" "$p" > "$TOP/Library/Receipts/$name.receipt"
+        names=$p
+        move_pkg_files "$b" "$p"
+        for d in $(exclusive_deps "$p"); do
+            if dep_movable "$d"; then
+                move_pkg_files "$b" "$d"
+                names="$names $d"
+            fi
+        done
+        printf 'bundle=%s\nrequested=%s\npackages=%s\nstate=installed\n' "$name" "$p" "$names" > "$TOP/Library/Receipts/$name.receipt"
+        if [ "$MODE" = clean ] && in_list "$p" "$COMPAT_PKGS"; then
+            FASDEQOS_APPS=$TOP/Applications FASDEQOS_LIB=$TOP/Library sh "$TOOLS_TMP/compat.sh" "$name"
+        fi
         chown -R "$uidgid" "$b"
         say "  $name.pkg"
     done
@@ -274,23 +888,36 @@ bundle_apps() {
     chmod 775 "$TOP/Applications"
 }
 
-convert() {
-    local sys=$TOP/System priv=$TOP/private
-    say "Applying the FasdeqOS layout"
-    if [ "$MODE" = clean ]; then
+install_userland() {
+    local sys=$TOP/System a
+    if [ "$MODE" != clean ]; then
+        bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr/bin/pkg
+        return 0
+    fi
+    if [ "$USERLAND" = busybox ]; then
+        bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr/bin/pkg
+        install -m 755 /usr/bin/busybox "$sys/bin/busybox"
+        for a in $(/usr/bin/busybox --list); do
+            if [ ! -e "$sys/bin/$a" ] && [ ! -L "$sys/bin/$a" ]; then
+                ln -s busybox "$sys/bin/$a"
+            fi
+        done
+    else
         bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr
         if [ -x "$sys/bin/bsdtar" ] && [ ! -e "$sys/bin/tar" ]; then
             cp "$sys/bin/bsdtar" "$sys/bin/tar"
         fi
-        mkdir -p "$sys/lib/fasdeqos"
-        if [ -e "$sys/bin/pacman" ]; then
-            mv "$sys/bin/pacman" "$sys/lib/fasdeqos/pacman"
-        fi
-    else
-        bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr/bin/pkg
     fi
-    mkdir -p /etc/initcpio
-    bsdtar -xpf "$PAYLOAD" -C / ./etc/initcpio
+    mkdir -p "$sys/lib/fasdeqos"
+    if [ -e "$sys/bin/pacman" ]; then
+        mv "$sys/bin/pacman" "$sys/lib/fasdeqos/pacman"
+    fi
+}
+
+convert() {
+    local sys=$TOP/System priv=$TOP/private
+    say "Applying the FasdeqOS layout"
+    install_userland
     : > "$priv/etc/fstab"
     mkdir -p "$priv/etc/tmpfiles.d" "$priv/etc/modules-load.d" "$priv/etc/default" "$priv/etc/fish"
     : > "$priv/etc/tmpfiles.d/home.conf"
@@ -302,78 +929,267 @@ convert() {
     grep -qx /usr/bin/fish "$priv/etc/shells" || echo /usr/bin/fish >> "$priv/etc/shells"
     printf 'usr\nbin\nlib\nlib64\nopt\netc\nvar\ntmp\nprivate\ndev\nproc\nsys\nrun\n' > "$TOP/root/.hidden"
     fix_shebangs "$sys"
+    write_os_release
+    write_tools
 }
 
-install_boot() {
-    local dir=$ESP/fasdeqos cmdline kver="" d c grubcfg
-    say "Creating the boot entry"
-    mkdir -p "$dir"
-    # Any installed kernel will do: prefer the running one, otherwise the newest one found.
+make_snapshots() {
+    local v d=$TOP/$SNAPDIR/$SNAPNAME
+    if [ -d "$d" ]; then
+        return 0
+    fi
+    say "Creating the FasdeqOS snapshot"
+    mkdir -p "$d"
+    for v in $VOLUMES; do
+        btrfs subvolume snapshot "$TOP/$v" "$d/$v" >/dev/null
+    done
+}
+
+pick_kernel() {
+    local d
     if [ -f "/usr/lib/modules/$(uname -r)/vmlinuz" ]; then
-        kver=$(uname -r)
+        KVER=$(uname -r)
     else
         for d in $(ls -1 /usr/lib/modules 2>/dev/null | sort -V -r); do
             if [ -f "/usr/lib/modules/$d/vmlinuz" ]; then
-                kver=$d
+                KVER=$d
                 break
             fi
         done
     fi
-    [ -n "$kver" ] || die "No installed kernel found in /usr/lib/modules (is a kernel package installed?)."
-    say "Using kernel $kver"
-    cp "/usr/lib/modules/$kver/vmlinuz" "$dir/vmlinuz"
-    cat > /tmp/fasdeqos-mkinitcpio.conf <<'CONF'
-MODULES=(btrfs vfat dm_mod)
-BINARIES=(btrfs)
-FILES=()
-HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
-CONF
-    mkinitcpio -c /tmp/fasdeqos-mkinitcpio.conf -k "$kver" -g "$dir/initramfs.img"
-    cmdline="root=UUID=$UUID fasdeqos_esp=$ESP_UUID rw init=/System/lib/systemd/systemd firmware_class.path=/usr/lib/firmware quiet"
-    # Edit the boot loader that is actually in use; never replace it.
-    # GRUB wins when it is installed with a config file, even if $ESP/loader exists.
-    grubcfg=""
-    for c in /boot/grub/grub.cfg /boot/grub2/grub.cfg /efi/grub/grub.cfg /boot/efi/grub/grub.cfg; do
-        if [ -f "$c" ]; then
-            grubcfg=$c
-            break
-        fi
-    done
-    if [ -d /etc/grub.d ] && [ -n "$grubcfg" ] && command -v grub-mkconfig >/dev/null; then
-        say "Adding a FasdeqOS entry to GRUB ($grubcfg)"
-        rm -f "$ESP/loader/entries/fasdeqos.conf"
-        cat > /etc/grub.d/09_fasdeqos <<GRUBENT
+    [ -n "$KVER" ] || die "No installed kernel found in /usr/lib/modules (is a kernel package installed?)."
+    say "Using kernel $KVER"
+}
+
+place_kernel() {
+    mkdir -p "$1"
+    cp "/usr/lib/modules/$KVER/vmlinuz" "$1/vmlinuz"
+    cp "$INITRAMFS" "$1/initramfs.img"
+}
+
+set_kv() {
+    local file=$1 key=$2 val=$3
+    if [ ! -f "$file" ]; then
+        return 0
+    fi
+    if grep -q "^$key=" "$file"; then
+        sed "s|^$key=.*|$key=$val|" "$file" > "$file.fix"
+        cat "$file.fix" > "$file"
+        rm -f "$file.fix"
+    else
+        printf '%s=%s\n' "$key" "$val" >> "$file"
+    fi
+}
+
+write_grub_scripts() {
+    local dir=$1
+    mkdir -p "$dir"
+    cat > "$dir/09_fasdeqos" <<GRUBENT
 #!/bin/sh
 cat <<'MENU'
 menuentry "FasdeqOS" {
     insmod part_gpt
     insmod fat
     search --no-floppy --fs-uuid --set=root $ESP_UUID
-    linux /fasdeqos/vmlinuz $cmdline
+    linux /fasdeqos/vmlinuz $CMDLINE
     initrd /fasdeqos/initramfs.img
 }
 MENU
 GRUBENT
-        chmod +x /etc/grub.d/09_fasdeqos
-        grub-mkconfig -o "$grubcfg"
-        grep -q 'menuentry "FasdeqOS"' "$grubcfg" || die "The FasdeqOS entry did not appear in $grubcfg."
-    elif [ -d "$ESP/loader" ]; then
-        say "Adding a FasdeqOS entry to systemd-boot"
-        mkdir -p "$ESP/loader/entries"
-        cat > "$ESP/loader/entries/fasdeqos.conf" <<ENTRY
+    rm -f "$dir/11_fasdeqos_windows"
+    if [ "$WINDOWS" -eq 1 ]; then
+        cat > "$dir/11_fasdeqos_windows" <<GRUBENT
+#!/bin/sh
+cat <<'MENU'
+menuentry "Windows Boot Manager" {
+    insmod part_gpt
+    insmod fat
+    insmod chain
+    search --no-floppy --fs-uuid --set=root $WIN_UUID
+    chainloader $WIN_FILE
+}
+MENU
+GRUBENT
+    fi
+    cat > "$dir/12_fasdeqos_snapshot" <<GRUBENT
+#!/bin/sh
+cat <<'MENU'
+menuentry "FasdeqOS snapshot" {
+    insmod part_gpt
+    insmod fat
+    search --no-floppy --fs-uuid --set=root $ESP_UUID
+    linux /fasdeqos/vmlinuz $SNAPCMDLINE
+    initrd /fasdeqos/initramfs.img
+}
+MENU
+GRUBENT
+    cat > "$dir/13_fasdeqos_uefi" <<'GRUBENT'
+#!/bin/sh
+cat <<'MENU'
+menuentry "UEFI Firmware Settings" {
+    fwsetup
+}
+MENU
+GRUBENT
+    chmod +x "$dir"/09_fasdeqos "$dir"/12_fasdeqos_snapshot "$dir"/13_fasdeqos_uefi
+    if [ -f "$dir/11_fasdeqos_windows" ]; then
+        chmod +x "$dir/11_fasdeqos_windows"
+    fi
+}
+
+prepare_grub_dir() {
+    local dir=$1 f
+    write_grub_scripts "$dir/grub.d"
+    for f in "$dir"/grub.d/*; do
+        case $(basename "$f") in
+            00_*|01_*|*fasdeqos*|README) continue ;;
+            30_os-prober) chmod -x "$f" ;;
+            *)
+                if [ "$MODE" = clean ]; then
+                    chmod -x "$f"
+                fi ;;
+        esac
+    done
+    set_kv "$dir/default/grub" GRUB_DEFAULT 0
+    set_kv "$dir/default/grub" GRUB_SAVEDEFAULT false
+    set_kv "$dir/default/grub" GRUB_DISABLE_OS_PROBER true
+}
+
+boot_grub() {
+    say "Adding FasdeqOS to GRUB ($GRUB_CFG)"
+    prepare_grub_dir /etc
+    prepare_grub_dir "$TOP/private/etc"
+    grub-mkconfig -o "$GRUB_CFG"
+    grep -q 'menuentry "FasdeqOS"' "$GRUB_CFG" || die "The FasdeqOS entry did not appear in $GRUB_CFG."
+}
+
+boot_limine() {
+    local conf=$LIMINE_CONF tmp prefix wprefix cfgprefix wcfgprefix
+    say "Adding FasdeqOS to Limine ($conf)"
+    tmp=$(mktemp /tmp/fasdeqos-limine.XXXXXX)
+    if [ ! -e "$conf.fasdeqos-backup" ]; then
+        cp -a "$conf" "$conf.fasdeqos-backup"
+    fi
+    if [ "$(findmnt -no SOURCE -T "$conf")" = "$ESP_DEV" ]; then
+        prefix='boot():'
+        cfgprefix='boot://'
+    else
+        prefix="guid($ESP_PARTUUID):"
+        cfgprefix="guid://$ESP_PARTUUID"
+    fi
+    if [ "$WIN_PARTUUID" = "$ESP_PARTUUID" ] && [ "$prefix" = 'boot():' ]; then
+        wprefix='boot():'
+        wcfgprefix='boot://'
+    else
+        wprefix="guid($WIN_PARTUUID):"
+        wcfgprefix="guid://$WIN_PARTUUID"
+    fi
+    if [ "${conf##*.}" = conf ]; then
+        {
+            awk '/^\//{exit} {print}' "$conf" | grep -vi '^[[:space:]]*default_entry' || true
+            printf 'default_entry: 1\n\n'
+            printf '/FasdeqOS\n    protocol: linux\n    path: %s/fasdeqos/vmlinuz\n    cmdline: %s\n    module_path: %s/fasdeqos/initramfs.img\n\n' "$prefix" "$CMDLINE" "$prefix"
+            if [ "$WINDOWS" -eq 1 ]; then
+                printf '/Windows Boot Manager\n    protocol: efi\n    path: %s%s\n\n' "$wprefix" "$WIN_FILE"
+            fi
+            printf '/FasdeqOS snapshot\n    protocol: linux\n    path: %s/fasdeqos/vmlinuz\n    cmdline: %s\n    module_path: %s/fasdeqos/initramfs.img\n\n' "$prefix" "$SNAPCMDLINE" "$prefix"
+            if [ "$MODE" != clean ]; then
+                awk 'f||/^\//{f=1;print}' "$conf"
+            fi
+        } > "$tmp"
+    else
+        {
+            awk '/^:/{exit} {print}' "$conf" | grep -vi '^[[:space:]]*default_entry' || true
+            printf 'DEFAULT_ENTRY=1\n\n'
+            printf ':FasdeqOS\n    PROTOCOL=linux\n    KERNEL_PATH=%s/fasdeqos/vmlinuz\n    CMDLINE=%s\n    MODULE_PATH=%s/fasdeqos/initramfs.img\n\n' "$cfgprefix" "$CMDLINE" "$cfgprefix"
+            if [ "$WINDOWS" -eq 1 ]; then
+                printf ':Windows Boot Manager\n    PROTOCOL=efi_chainload\n    IMAGE_PATH=%s%s\n\n' "$wcfgprefix" "$WIN_FILE"
+            fi
+            printf ':FasdeqOS snapshot\n    PROTOCOL=linux\n    KERNEL_PATH=%s/fasdeqos/vmlinuz\n    CMDLINE=%s\n    MODULE_PATH=%s/fasdeqos/initramfs.img\n\n' "$cfgprefix" "$SNAPCMDLINE" "$cfgprefix"
+            if [ "$MODE" != clean ]; then
+                awk 'f||/^:/{f=1;print}' "$conf"
+            fi
+        } > "$tmp"
+    fi
+    cat "$tmp" > "$conf"
+    rm -f "$tmp"
+}
+
+boot_sdboot() {
+    local dir=$SDB_ROOT/loader/entries lc=$SDB_ROOT/loader/loader.conf mid sdpart
+    say "Adding FasdeqOS to systemd-boot ($SDB_ROOT)"
+    mkdir -p "$dir"
+    if [ "$SDB_ROOT" != "$ESP" ]; then
+        place_kernel "$SDB_ROOT/fasdeqos"
+    fi
+    if [ "$MODE" = clean ]; then
+        rm -f "$dir"/*.conf
+        mid=$(cat /etc/machine-id 2>/dev/null || true)
+        if [ -n "$mid" ] && [ -d "$SDB_ROOT/$mid" ]; then
+            rm -rf "${SDB_ROOT:?}/$mid"
+        fi
+        rm -f "$ESP"/EFI/Linux/*.efi
+    fi
+    cat > "$dir/fasdeqos.conf" <<ENTRY
 title FasdeqOS
+sort-key a1-fasdeqos
 linux /fasdeqos/vmlinuz
 initrd /fasdeqos/initramfs.img
-options $cmdline
+options $CMDLINE
 ENTRY
-    else
-        die "Unsupported boot loader. The kernel and initramfs are in $dir."
+    sdpart=$(blkid -s PARTUUID -o value "$(findmnt -no SOURCE "$SDB_ROOT")" || true)
+    rm -f "$dir/windows.conf"
+    if [ "$WINDOWS" -eq 1 ] && [ "$WIN_PARTUUID" = "$sdpart" ]; then
+        cat > "$dir/windows.conf" <<ENTRY
+title Windows Boot Manager
+sort-key b1-windows
+efi $WIN_FILE
+ENTRY
     fi
+    cat > "$dir/fasdeqos-snapshot.conf" <<ENTRY
+title FasdeqOS snapshot
+sort-key c1-snapshot
+linux /fasdeqos/vmlinuz
+initrd /fasdeqos/initramfs.img
+options $SNAPCMDLINE
+ENTRY
+    touch "$lc"
+    { printf 'default fasdeqos.conf\n'; grep -v '^[[:space:]]*default' "$lc" || true; } > "$lc.fix"
+    cat "$lc.fix" > "$lc"
+    rm -f "$lc.fix"
+}
+
+install_boot() {
+    local l
+    say "Creating the boot entries"
+    write_initcpio
+    pick_kernel
+    INITRAMFS=$(mktemp /tmp/fasdeqos-initramfs.XXXXXX)
+    cat > /tmp/fasdeqos-mkinitcpio.conf <<'CONF'
+MODULES=(btrfs vfat dm_mod overlay)
+BINARIES=(btrfs)
+FILES=()
+HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
+CONF
+    mkinitcpio -c /tmp/fasdeqos-mkinitcpio.conf -k "$KVER" -g "$INITRAMFS"
+    place_kernel "$ESP/fasdeqos"
+    CMDLINE="root=UUID=$UUID fasdeqos_esp=$ESP_UUID rw init=/System/lib/systemd/systemd firmware_class.path=/usr/lib/firmware quiet"
+    if [ "$SEAL" = sealed ]; then
+        CMDLINE="$CMDLINE fasdeqos_sealed=1"
+    fi
+    SNAPCMDLINE="$CMDLINE fasdeqos_snap=$SNAPDIR/$SNAPNAME/"
+    for l in $LOADERS; do
+        case $l in
+            grub) boot_grub ;;
+            limine) boot_limine ;;
+            systemd-boot) boot_sdboot ;;
+        esac
+    done
 }
 
 schedule_purge() {
     local dir=$TOP/private/var/lib/fasdeqos list fsroot r s e
-    say "Scheduling removal of the old system"
+    say "Preparing the removal of the old system"
     mkdir -p "$dir" "$TOP/private/etc/systemd/system/multi-user.target.wants"
     list=$dir/purge
     : > "$list"
@@ -386,7 +1202,7 @@ schedule_purge() {
     done < <(findmnt -rn -t btrfs -o FSROOT,SOURCE)
     if [ "$fsroot" = "/" ]; then
         for e in $(ls -A "$TOP"); do
-            case " $VOLUMES lost+found " in
+            case " $VOLUMES lost+found $SNAPDIR " in
                 *" $e "*) continue ;;
             esac
             if grep -q "^subvol $e\$" "$list"; then
@@ -398,30 +1214,40 @@ schedule_purge() {
     sort -u "$list" -o "$list"
     cat > "$TOP/System/bin/fasdeqos-purge" <<'PURGE'
 #!/usr/bin/env sh
-set -e
+top=/run/fasdeqos-top
 src=$(findmnt -no SOURCE /System)
 dev=${src%%\[*}
-mkdir -p /run/fasdeqos-top
-mount -o subvolid=5 "$dev" /run/fasdeqos-top
+[ -n "$dev" ] || exit 1
+mkdir -p "$top"
+mount -o subvolid=5 "$dev" "$top" || exit 1
 while read -r kind name; do
+    case $name in
+        ""|root|System|Applications|Library|Users|private|lost+found|.fasdeqos-snapshots) continue ;;
+    esac
     case $kind in
-        subvol) btrfs subvolume delete "/run/fasdeqos-top/$name" ;;
-        entry) rm -rf "/run/fasdeqos-top/$name" ;;
+        subvol)
+            if [ -e "$top/$name" ]; then
+                btrfs subvolume delete --recursive "$top/$name"
+            fi ;;
+        entry)
+            rm -rf "$top/$name" ;;
     esac
 done < /var/lib/fasdeqos/purge
-umount /run/fasdeqos-top
+btrfs subvolume sync "$top" >/dev/null 2>&1
+umount "$top"
 rm -f /var/lib/fasdeqos/purge
+exit 0
 PURGE
     chmod +x "$TOP/System/bin/fasdeqos-purge"
     cat > "$TOP/private/etc/systemd/system/fasdeqos-purge.service" <<'UNIT'
 [Unit]
-Description=Remove the previous system after the first successful boot
+Description=Remove the previous system
 ConditionPathExists=/var/lib/fasdeqos/purge
 After=multi-user.target
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/fasdeqos-purge
+ExecStart=/usr/bin/sh /usr/bin/fasdeqos-purge
 
 [Install]
 WantedBy=multi-user.target
@@ -429,12 +1255,62 @@ UNIT
     ln -sf /etc/systemd/system/fasdeqos-purge.service "$TOP/private/etc/systemd/system/multi-user.target.wants/fasdeqos-purge.service"
 }
 
+purge_now() {
+    local list=$TOP/private/var/lib/fasdeqos/purge rest rootsub kind name left=0
+    [ -s "$list" ] || return 0
+    say "Deleting the old system"
+    rootsub=$(findmnt -no FSROOT / | sed 's/\[.*//')
+    rootsub=${rootsub#/}
+    rest=$(mktemp /tmp/fasdeqos-rest.XXXXXX)
+    while read -r kind name; do
+        if [ "$kind" != subvol ]; then
+            printf '%s %s\n' "$kind" "$name" >> "$rest"
+            left=1
+            continue
+        fi
+        if [ "$name" = "$rootsub" ] || [ -z "$name" ]; then
+            continue
+        fi
+        if [ ! -e "$TOP/$name" ]; then
+            continue
+        fi
+        if ! btrfs subvolume delete --recursive "$TOP/$name" >/dev/null; then
+            printf 'subvol %s\n' "$name" >> "$rest"
+            left=1
+        fi
+    done < "$list"
+    if [ -n "$rootsub" ]; then
+        printf 'subvol %s\n' "$rootsub" >> "$rest"
+    fi
+    cat "$rest" > "$list"
+    rm -f "$rest"
+    if [ -z "$rootsub" ]; then
+        if [ "$left" -eq 1 ]; then
+            say "Some old files remain and are removed after the first boot."
+        fi
+        return 0
+    fi
+    sync
+    echo 1 > /proc/sys/kernel/sysrq
+    if btrfs subvolume delete --recursive "$TOP/$rootsub" >/dev/null 2>&1; then
+        printf '==> The old system is deleted. Rebooting into FasdeqOS in 10 seconds (Ctrl+C to cancel).\n'
+        read -r -t 10 _ || true
+        echo s > /proc/sysrq-trigger
+        echo u > /proc/sysrq-trigger
+        echo b > /proc/sysrq-trigger
+    else
+        say "The running system cannot be deleted while it is in use. It is removed after the first boot."
+    fi
+}
+
 finish() {
-    umount "$TOP"
     say "Migration complete."
     if [ "$MODE" = clean ]; then
-        say "Reboot and choose FasdeqOS. The old system is removed after the first successful boot."
+        purge_now
+        say "Reboot and choose FasdeqOS."
+        umount "$TOP"
     else
+        umount "$TOP"
         say "Reboot and choose FasdeqOS. Your old system is untouched."
     fi
 }
@@ -444,6 +1320,10 @@ while [ $# -gt 0 ]; do
         --backup) MODE=backup ;;
         --no-backup) MODE=clean ;;
         --yes) ASSUME_YES=1 ;;
+        --open) SEAL=open ;;
+        --sealed) SEAL=sealed ;;
+        --chimerautils) USERLAND=chimerautils ;;
+        --busybox) USERLAND=busybox ;;
         --payload)
             [ $# -ge 2 ] || die "--payload needs a file path or URL."
             PAYLOAD_SRC=$2
@@ -463,11 +1343,13 @@ make_volumes
 if [ "$RESUME" -eq 0 ]; then
     copy_files
     if [ "$MODE" = clean ]; then
+        save_gnu
         remove_gnu
     fi
     bundle_apps
     convert
 fi
+make_snapshots
 install_boot
 if [ "$MODE" = clean ]; then
     schedule_purge
