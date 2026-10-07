@@ -1,6 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+# Where the payload comes from (first match wins):
+#   1. --payload FILE|URL            or  FASDEQOS_PAYLOAD=FILE|URL
+#   2. fasdeqos-payload.tar.zst next to this script, or in ./out/ next to it
+#   3. FASDEQOS_PAYLOAD_URL (default: raw file in the GitHub repo)
 DEFAULT_PAYLOAD_URL=https://raw.githubusercontent.com/Fasdeq13/fasdeqOS/main/fasdeqos-payload.tar.zst
 PAYLOAD_URL=${FASDEQOS_PAYLOAD_URL:-$DEFAULT_PAYLOAD_URL}
 PAYLOAD_SRC=${FASDEQOS_PAYLOAD:-}
@@ -301,7 +305,7 @@ convert() {
 }
 
 install_boot() {
-    local dir=$ESP/fasdeqos cmdline kver="" d
+    local dir=$ESP/fasdeqos cmdline kver="" d c grubcfg
     say "Creating the boot entry"
     mkdir -p "$dir"
     # Any installed kernel will do: prefer the running one, otherwise the newest one found.
@@ -326,19 +330,24 @@ HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
 CONF
     mkinitcpio -c /tmp/fasdeqos-mkinitcpio.conf -k "$kver" -g "$dir/initramfs.img"
     cmdline="root=UUID=$UUID fasdeqos_esp=$ESP_UUID rw init=/System/lib/systemd/systemd firmware_class.path=/usr/lib/firmware quiet"
-    if [ -d "$ESP/loader" ]; then
-        mkdir -p "$ESP/loader/entries"
-        cat > "$ESP/loader/entries/fasdeqos.conf" <<ENTRY
-title FasdeqOS
-linux /fasdeqos/vmlinuz
-initrd /fasdeqos/initramfs.img
-options $cmdline
-ENTRY
-    elif [ -d /etc/grub.d ]; then
+    # Edit the boot loader that is actually in use; never replace it.
+    # GRUB wins when it is installed with a config file, even if $ESP/loader exists.
+    grubcfg=""
+    for c in /boot/grub/grub.cfg /boot/grub2/grub.cfg /efi/grub/grub.cfg /boot/efi/grub/grub.cfg; do
+        if [ -f "$c" ]; then
+            grubcfg=$c
+            break
+        fi
+    done
+    if [ -d /etc/grub.d ] && [ -n "$grubcfg" ] && command -v grub-mkconfig >/dev/null; then
+        say "Adding a FasdeqOS entry to GRUB ($grubcfg)"
+        rm -f "$ESP/loader/entries/fasdeqos.conf"
         cat > /etc/grub.d/09_fasdeqos <<GRUBENT
 #!/bin/sh
 cat <<'MENU'
 menuentry "FasdeqOS" {
+    insmod part_gpt
+    insmod fat
     search --no-floppy --fs-uuid --set=root $ESP_UUID
     linux /fasdeqos/vmlinuz $cmdline
     initrd /fasdeqos/initramfs.img
@@ -346,7 +355,17 @@ menuentry "FasdeqOS" {
 MENU
 GRUBENT
         chmod +x /etc/grub.d/09_fasdeqos
-        grub-mkconfig -o /boot/grub/grub.cfg
+        grub-mkconfig -o "$grubcfg"
+        grep -q 'menuentry "FasdeqOS"' "$grubcfg" || die "The FasdeqOS entry did not appear in $grubcfg."
+    elif [ -d "$ESP/loader" ]; then
+        say "Adding a FasdeqOS entry to systemd-boot"
+        mkdir -p "$ESP/loader/entries"
+        cat > "$ESP/loader/entries/fasdeqos.conf" <<ENTRY
+title FasdeqOS
+linux /fasdeqos/vmlinuz
+initrd /fasdeqos/initramfs.img
+options $cmdline
+ENTRY
     else
         die "Unsupported boot loader. The kernel and initramfs are in $dir."
     fi
