@@ -1,10 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Where the payload comes from (first match wins):
-#   1. --payload FILE|URL            or  FASDEQOS_PAYLOAD=FILE|URL
-#   2. fasdeqos-payload.tar.zst next to this script, or in ./out/ next to it
-#   3. FASDEQOS_PAYLOAD_URL (default: raw file in the GitHub repo)
 DEFAULT_PAYLOAD_URL=https://raw.githubusercontent.com/Fasdeq13/fasdeqOS/main/fasdeqos-payload.tar.zst
 PAYLOAD_URL=${FASDEQOS_PAYLOAD_URL:-$DEFAULT_PAYLOAD_URL}
 PAYLOAD_SRC=${FASDEQOS_PAYLOAD:-}
@@ -16,6 +12,7 @@ VOLUMES="root System Applications Library Users private"
 GNU_PKGS="coreutils grep sed findutils gawk diffutils gzip tar which"
 MODE=""
 ASSUME_YES=0
+RESUME=0
 
 die() {
     printf 'Error: %s\n' "$1" >&2
@@ -162,16 +159,29 @@ prepare() {
 }
 
 make_volumes() {
-    local v
+    local v have=0
     say "Creating btrfs volumes"
     mkdir -p "$TOP"
-    mount -o subvolid=5 "$DEV" "$TOP"
+    mountpoint -q "$TOP" || mount -o subvolid=5 "$DEV" "$TOP"
     for v in $VOLUMES; do
-        [ ! -e "$TOP/$v" ] || die "$v already exists on the btrfs top level."
+        if [ -e "$TOP/$v" ]; then
+            have=$((have + 1))
+        fi
     done
-    for v in $VOLUMES; do
-        btrfs subvolume create "$TOP/$v" >/dev/null
-    done
+    if [ "$have" -eq 0 ]; then
+        for v in $VOLUMES; do
+            btrfs subvolume create "$TOP/$v" >/dev/null
+        done
+        return 0
+    fi
+    # Volumes from an interrupted run: resume only if the file stage had finished.
+    if [ "$have" -eq 6 ] && [ -f "$TOP/root/.hidden" ] && [ -x "$TOP/System/bin/pkg" ] && [ -e "$TOP/private/etc/fstab" ]; then
+        RESUME=1
+        say "Volumes and files already prepared, skipping to the boot entry"
+        return 0
+    fi
+    die "Incomplete FasdeqOS volumes found on the btrfs top level. Delete them first:
+       btrfs subvolume delete $TOP/root $TOP/System $TOP/Applications $TOP/Library $TOP/Users $TOP/private"
 }
 
 clone() {
@@ -291,17 +301,30 @@ convert() {
 }
 
 install_boot() {
-    local dir=$ESP/fasdeqos cmdline
+    local dir=$ESP/fasdeqos cmdline kver="" d
     say "Creating the boot entry"
     mkdir -p "$dir"
-    cp "/usr/lib/modules/$(uname -r)/vmlinuz" "$dir/vmlinuz"
+    # Any installed kernel will do: prefer the running one, otherwise the newest one found.
+    if [ -f "/usr/lib/modules/$(uname -r)/vmlinuz" ]; then
+        kver=$(uname -r)
+    else
+        for d in $(ls -1 /usr/lib/modules 2>/dev/null | sort -V -r); do
+            if [ -f "/usr/lib/modules/$d/vmlinuz" ]; then
+                kver=$d
+                break
+            fi
+        done
+    fi
+    [ -n "$kver" ] || die "No installed kernel found in /usr/lib/modules (is a kernel package installed?)."
+    say "Using kernel $kver"
+    cp "/usr/lib/modules/$kver/vmlinuz" "$dir/vmlinuz"
     cat > /tmp/fasdeqos-mkinitcpio.conf <<'CONF'
 MODULES=(btrfs vfat dm_mod)
 BINARIES=(btrfs)
 FILES=()
 HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
 CONF
-    mkinitcpio -c /tmp/fasdeqos-mkinitcpio.conf -k "$(uname -r)" -g "$dir/initramfs.img"
+    mkinitcpio -c /tmp/fasdeqos-mkinitcpio.conf -k "$kver" -g "$dir/initramfs.img"
     cmdline="root=UUID=$UUID fasdeqos_esp=$ESP_UUID rw init=/System/lib/systemd/systemd firmware_class.path=/usr/lib/firmware quiet"
     if [ -d "$ESP/loader" ]; then
         mkdir -p "$ESP/loader/entries"
@@ -418,12 +441,14 @@ choose_mode
 confirm
 prepare
 make_volumes
-copy_files
-if [ "$MODE" = clean ]; then
-    remove_gnu
+if [ "$RESUME" -eq 0 ]; then
+    copy_files
+    if [ "$MODE" = clean ]; then
+        remove_gnu
+    fi
+    bundle_apps
+    convert
 fi
-bundle_apps
-convert
 install_boot
 if [ "$MODE" = clean ]; then
     schedule_purge
