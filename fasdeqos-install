@@ -1,0 +1,989 @@
+#!/usr/bin/env bash
+set -eEuo pipefail
+trap 'gum style --foreground 196 "Installation failed at line $LINENO."; exit 1' ERR
+
+SHARE=/System/share/fasdeqos
+STAGE=/mnt/private/stage
+TOP=/run/fasdeqos-top
+OPTS=compress=zstd:1,noatime
+BASE_PKGS="filesystem glibc musl bash fish pacman archlinux-keyring pacman-mirrorlist util-linux kmod systemd linux linux-firmware mkinitcpio iptables btrfs-progs e2fsprogs dosfstools iproute2 procps-ng acl attr bzip2 xz zlib zstd openssl ncurses libedit grub efibootmgr sudo fastfetch"
+GNU_PKGS="coreutils grep sed findutils gawk tar diffutils gzip less mkinitcpio bash"
+
+export GUM_CHOOSE_CURSOR_FOREGROUND="#a4cf68"
+export GUM_CHOOSE_SELECTED_FOREGROUND="#a4cf68"
+export GUM_CHOOSE_HEADER_FOREGROUND="#7dcfff"
+export GUM_CONFIRM_PROMPT_FOREGROUND="#7dcfff"
+export GUM_CONFIRM_SELECTED_BACKGROUND="#a4cf68"
+export GUM_CONFIRM_SELECTED_FOREGROUND="#1a1b26"
+export GUM_INPUT_CURSOR_FOREGROUND="#a4cf68"
+export GUM_INPUT_PROMPT_FOREGROUND="#7dcfff"
+export GUM_FILTER_INDICATOR_FOREGROUND="#a4cf68"
+export GUM_FILTER_MATCH_FOREGROUND="#a4cf68"
+export GUM_FILTER_HEADER_FOREGROUND="#7dcfff"
+
+die() {
+    gum style --foreground 196 "$1"
+    exit 1
+}
+
+C_ACC=$'\e[92m'
+C_BLUE=$'\e[96m'
+C_DIM=$'\e[2m'
+C_RST=$'\e[0m'
+C_BTN=$'\e[30;102m'
+
+glyph() {
+    case $1 in
+        F) ROWS=("█████" "█    " "████ " "█    " "█    ") ;;
+        A) ROWS=(" ███ " "█   █" "█████" "█   █" "█   █") ;;
+        S) ROWS=(" ████" "█    " " ███ " "    █" "████ ") ;;
+        D) ROWS=("████ " "█   █" "█   █" "█   █" "████ ") ;;
+        E) ROWS=("█████" "█    " "████ " "█    " "█████") ;;
+        Q) ROWS=(" ███ " "█   █" "█   █" "█  █ " " ██ █") ;;
+        O) ROWS=(" ███ " "█   █" "█   █" "█   █" " ███ ") ;;
+    esac
+}
+
+banner() {
+    local r ch line
+    for r in 0 1 2 3 4; do
+        line=""
+        for ch in F A S D E Q O S; do
+            glyph "$ch"
+            line="$line${ROWS[$r]}  "
+        done
+        printf '%s\n' "$line"
+    done | gum style --foreground "#a4cf68"
+}
+
+title() {
+    clear
+    banner
+    echo
+    gum style --foreground "#7dcfff" "$1"
+    echo
+}
+
+hint() {
+    printf '%s%s%s\n\n' "$C_DIM" "$1" "$C_RST"
+}
+
+read_key() {
+    local rest
+    IFS= read -rsn1 KEY
+    if [[ $KEY == $'\e' ]]; then
+        read -rsn2 -t 0.05 rest || true
+        KEY+=$rest
+    fi
+}
+
+is_up() {
+    case $KEY in
+        $'\e[A'|w|W|k|ц|Ц) return 0 ;;
+    esac
+    return 1
+}
+
+is_down() {
+    case $KEY in
+        $'\e[B'|s|S|j|ы|Ы) return 0 ;;
+    esac
+    return 1
+}
+
+is_left() {
+    case $KEY in
+        $'\e[D'|a|A|h|ф|Ф) return 0 ;;
+    esac
+    return 1
+}
+
+is_right() {
+    case $KEY in
+        $'\e[C'|d|D|l|в|В) return 0 ;;
+    esac
+    return 1
+}
+
+draw_list() {
+    local i mark
+    for i in "${!LIST_OPTS[@]}"; do
+        mark=""
+        if [ "$LIST_MULTI" = 1 ]; then
+            if [ "${LIST_ON[$i]}" = 1 ]; then
+                mark="[x] "
+            else
+                mark="[ ] "
+            fi
+        fi
+        if [ "$i" -eq "$LIST_CUR" ]; then
+            printf '%s❯ %s%s%s\e[K\n' "$C_ACC" "$mark" "${LIST_OPTS[$i]}" "$C_RST"
+        else
+            printf '  %s%s\e[K\n' "$mark" "${LIST_OPTS[$i]}"
+        fi
+    done
+}
+
+run_list() {
+    local n=${#LIST_OPTS[@]}
+    printf '\e[?25l'
+    draw_list
+    while :; do
+        read_key
+        if [ -z "$KEY" ]; then
+            break
+        fi
+        if is_up; then
+            LIST_CUR=$(((LIST_CUR - 1 + n) % n))
+        elif is_down; then
+            LIST_CUR=$(((LIST_CUR + 1) % n))
+        elif [ "$LIST_MULTI" = 1 ] && [ "$KEY" = " " ]; then
+            if [ "${LIST_ON[$LIST_CUR]}" = 1 ]; then
+                LIST_ON[$LIST_CUR]=0
+            else
+                LIST_ON[$LIST_CUR]=1
+            fi
+        fi
+        printf '\e[%dA' "$n"
+        draw_list
+    done
+    printf '\e[?25h'
+}
+
+select_one() {
+    if [ -n "$1" ]; then
+        printf '%s%s%s\n\n' "$C_BLUE" "$1" "$C_RST"
+    fi
+    shift
+    LIST_OPTS=("$@")
+    LIST_MULTI=0
+    LIST_CUR=0
+    LIST_ON=()
+    run_list
+    SEL_INDEX=$LIST_CUR
+    SELECTED=${LIST_OPTS[$LIST_CUR]}
+}
+
+select_many() {
+    local header=$1 pre=$2 i
+    shift 2
+    if [ -n "$header" ]; then
+        printf '%s%s%s\n\n' "$C_BLUE" "$header" "$C_RST"
+    fi
+    LIST_OPTS=("$@")
+    LIST_MULTI=1
+    LIST_CUR=0
+    LIST_ON=()
+    for i in "${!LIST_OPTS[@]}"; do
+        LIST_ON[$i]=0
+    done
+    if [ "$pre" -ge 0 ]; then
+        LIST_ON[$pre]=1
+    fi
+    run_list
+    SELECTED=""
+    for i in "${!LIST_OPTS[@]}"; do
+        if [ "${LIST_ON[$i]}" = 1 ]; then
+            SELECTED="${SELECTED:+$SELECTED$'\n'}${LIST_OPTS[$i]}"
+        fi
+    done
+}
+
+confirm() {
+    local yes=$1 no=$2 sel=${3:-0}
+    printf '\e[?25l'
+    while :; do
+        if [ "$sel" -eq 0 ]; then
+            printf '\r  %s  %s  %s    %s\e[K' "$C_BTN" "$yes" "$C_RST" "$no"
+        else
+            printf '\r  %s    %s  %s  %s\e[K' "$yes" "$C_BTN" "$no" "$C_RST"
+        fi
+        read_key
+        if [ -z "$KEY" ]; then
+            break
+        elif is_left; then
+            sel=0
+        elif is_right; then
+            sel=1
+        fi
+    done
+    printf '\n\e[?25h'
+    return "$sel"
+}
+
+die() {
+    gum style --foreground 196 "$1"
+    exit 1
+}
+
+part() {
+    case $1 in
+        *[0-9]) echo "${1}p$2" ;;
+        *) echo "$1$2" ;;
+    esac
+}
+
+welcome() {
+    title "Welcome to FasdeqOS"
+    gum style "This installer will set up FasdeqOS on your computer."
+    gum style "It asks a few questions and takes about 15 minutes."
+    echo
+    hint "←/→ or A/D move  •  Enter select"
+    confirm "Start" "Exit" || exit 1
+}
+
+network_ok() {
+    local code
+    code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 6 https://geo.mirror.pkgbuild.com/core/os/x86_64/core.db 2>/dev/null || true)
+    [ -n "$code" ] && [ "$code" != 000 ]
+}
+
+show_diagnostics() {
+    clear
+    ip -br addr || true
+    echo
+    systemctl is-active dbus.socket dbus-broker.service NetworkManager.service systemd-resolved.service systemd-udevd.service || true
+    echo
+    nmcli device status || true
+    echo
+    curl -sS -o /dev/null -w 'http %{http_code}\n' --max-time 6 https://geo.mirror.pkgbuild.com/core/os/x86_64/core.db 2>&1 || true
+    echo
+    journalctl -u NetworkManager -b --no-pager -n 12 2>&1 || true
+    echo
+    read -rsn1 -p "Press any key to go back " _ || true
+}
+
+net_devices() {
+    nmcli -t -f DEVICE,TYPE device 2>/dev/null | awk -F: '$2 == "ethernet" || $2 == "wifi" {print $1 ":" $2}'
+}
+
+signal_bars() {
+    if [ "$1" -ge 75 ]; then
+        printf '[####]'
+    elif [ "$1" -ge 50 ]; then
+        printf '[### ]'
+    elif [ "$1" -ge 25 ]; then
+        printf '[##  ]'
+    else
+        printf '[#   ]'
+    fi
+}
+
+wifi_connect() {
+    local dev=$1 ssid=$2 sec=$3 pass
+    if [ -z "$sec" ]; then
+        nmcli device wifi connect "$ssid" ifname "$dev" >/dev/null 2>&1 || true
+        return 0
+    fi
+    while :; do
+        pass=$(gum input --password --prompt "Password for $ssid: " --placeholder "leave empty to go back") || return 1
+        if [ -z "$pass" ]; then
+            return 1
+        fi
+        nmcli connection delete id "$ssid" >/dev/null 2>&1 || true
+        if gum spin --title "Connecting to $ssid..." -- nmcli device wifi connect "$ssid" password "$pass" ifname "$dev"; then
+            return 0
+        fi
+        gum style --foreground 196 "Wrong password for $ssid, or the network is out of reach. Try again."
+    done
+}
+
+wifi_setup() {
+    local dev=$1
+    local -a names=() secs=() labels=()
+    local -A seen=()
+    local line ssid sig sec n i
+    title "Wi-Fi ($dev)"
+    rfkill unblock wifi 2>/dev/null || true
+    gum spin --title "Scanning for networks..." -- bash -c "nmcli device wifi rescan ifname $dev >/dev/null 2>&1; sleep 4"
+    while IFS= read -r line; do
+        line=${line//\\:/$'\x01'}
+        IFS=: read -r ssid sig sec <<< "$line"
+        ssid=${ssid//$'\x01'/:}
+        sig=${sig:-0}
+        if [ -z "$ssid" ] || [ -n "${seen[$ssid]:-}" ]; then
+            continue
+        fi
+        seen[$ssid]=1
+        if [ "$sec" = "--" ]; then
+            sec=""
+        fi
+        names+=("$ssid")
+        secs+=("$sec")
+        labels+=("$(printf '%-26s %s %3s%%  %s' "$ssid" "$(signal_bars "$sig")" "$sig" "${sec:-open}")")
+    done < <(nmcli -t -f SSID,SIGNAL,SECURITY device wifi list ifname "$dev")
+    labels+=("Scan again" "Back")
+    n=${#names[@]}
+    title "Wi-Fi ($dev)"
+    hint "↑/↓ or W/S move  •  Enter select"
+    select_one "Choose a network" "${labels[@]}"
+    if [ "$SEL_INDEX" -eq "$n" ]; then
+        return 0
+    fi
+    if [ "$SEL_INDEX" -eq $((n + 1)) ]; then
+        return 1
+    fi
+    if wifi_connect "$dev" "${names[$SEL_INDEX]}" "${secs[$SEL_INDEX]}"; then
+        for i in $(seq 1 10); do
+            if network_ok; then
+                break
+            fi
+            sleep 1
+        done
+    fi
+    return 0
+}
+
+wired_screen() {
+    title "Ethernet ($1)"
+    gum style "Connect a network cable."
+    echo
+    hint "↑/↓ or W/S move  •  Enter select"
+    select_one "" "Check again" "Show diagnostics" "Back"
+    case $SELECTED in
+        "Show diagnostics") show_diagnostics ;;
+        Back) return 1 ;;
+    esac
+    return 0
+}
+
+handle_device() {
+    local dev=${1%%:*} type=${1#*:}
+    if [ "$type" = wifi ]; then
+        wifi_setup "$dev"
+    else
+        wired_screen "$dev"
+    fi
+}
+
+check_network() {
+    local i d t n
+    local -a devs labels
+    clear
+    banner
+    for i in $(seq 1 15); do
+        if network_ok; then
+            return 0
+        fi
+        sleep 1
+    done
+    until network_ok; do
+        devs=()
+        labels=()
+        while IFS=: read -r d t; do
+            devs+=("$d:$t")
+            if [ "$t" = wifi ]; then
+                labels+=("Wi-Fi ($d)")
+            else
+                labels+=("Ethernet ($d)")
+            fi
+        done < <(net_devices)
+        n=${#devs[@]}
+        if [ "$n" -eq 0 ]; then
+            title "No network adapter"
+            gum style "No network adapter was found."
+            echo
+            hint "↑/↓ or W/S move  •  Enter select"
+            select_one "" "Check again" "Show diagnostics" "Exit"
+            case $SELECTED in
+                "Show diagnostics") show_diagnostics ;;
+                Exit) exit 1 ;;
+            esac
+        elif [ "$n" -eq 1 ]; then
+            if ! handle_device "${devs[0]}"; then
+                exit 1
+            fi
+        else
+            title "Network"
+            hint "↑/↓ or W/S move  •  Enter select"
+            select_one "Choose a network adapter" "${labels[@]}" "Show diagnostics" "Exit"
+            if [ "$SEL_INDEX" -eq "$n" ]; then
+                show_diagnostics
+            elif [ "$SEL_INDEX" -eq $((n + 1)) ]; then
+                exit 1
+            else
+                handle_device "${devs[$SEL_INDEX]}" || true
+            fi
+        fi
+    done
+}
+
+choose_language() {
+    title "Language"
+    hint "↑/↓ or W/S move  •  Enter select"
+    select_one "Select your language" "English" "Русский"
+    LANG_NAME=$SELECTED
+    case $SELECTED in
+        Русский) LANG_CODE=ru_RU.UTF-8; LOCALES="en_US.UTF-8 ru_RU.UTF-8"; FONT=cyr-sun16 ;;
+        *) LANG_CODE=en_US.UTF-8; LOCALES="en_US.UTF-8"; FONT="" ;;
+    esac
+}
+
+choose_keyboard() {
+    title "Keyboard layouts"
+    local line first
+    hint "↑/↓ or W/S move  •  Space select  •  Enter confirm"
+    select_many "Select one or more layouts" 0 \
+        "us – English (US)" "gb – English (UK)" "ru – Russian" "ua – Ukrainian" "de – German" "fr – French" "es – Spanish" "it – Italian" "pl – Polish"
+    if [ -z "$SELECTED" ]; then
+        SELECTED="us – English (US)"
+    fi
+    LAYOUTS=""
+    while read -r line; do
+        LAYOUTS="${LAYOUTS:+$LAYOUTS,}${line%% *}"
+    done <<< "$SELECTED"
+    TOGGLE=""
+    COMBO="none"
+    if [[ $LAYOUTS == *,* ]]; then
+        title "Layout switch shortcut"
+        hint "↑/↓ or W/S move  •  Enter select"
+        select_one "Shortcut to switch layouts" "Alt+Shift" "Win+Space" "Ctrl+Shift" "Caps Lock" "Alt+Space"
+        COMBO=$SELECTED
+        case $SELECTED in
+            Alt+Shift) TOGGLE=grp:alt_shift_toggle ;;
+            Win+Space) TOGGLE=grp:win_space_toggle ;;
+            Ctrl+Shift) TOGGLE=grp:ctrl_shift_toggle ;;
+            "Caps Lock") TOGGLE=grp:caps_toggle ;;
+            Alt+Space) TOGGLE=grp:alt_space_toggle ;;
+        esac
+    fi
+    first=${LAYOUTS%%,*}
+    case $first in
+        de) VCMAP=de-latin1 ;;
+        gb) VCMAP=uk ;;
+        pl) VCMAP=pl2 ;;
+        *) VCMAP=$first ;;
+    esac
+}
+
+choose_timezone() {
+    title "Time zone"
+    hint "Type to search  •  ↑/↓ move  •  Enter select"
+    TZ_NAME=$( { echo UTC; cd /usr/share/zoneinfo && find Africa America Antarctica Asia Atlantic Australia Europe Indian Pacific -type f | sort; } | gum filter --height 12 --placeholder "Search, for example Europe/Helsinki") || exit 1
+}
+
+choose_mirror() {
+    local code name
+    code=$(awk -v tz="$TZ_NAME" '$3 == tz {print $1}' /usr/share/zoneinfo/zone.tab | head -n1)
+    name=""
+    if [ -n "$code" ]; then
+        name=$(awk -F'\t' -v c="$code" '$1 == c {print $2}' /usr/share/zoneinfo/iso3166.tab)
+    fi
+    title "Package mirror"
+    hint "↑/↓ or W/S move  •  Enter select"
+    if [ -n "$name" ]; then
+        select_one "Where should packages be downloaded from?" "$name (recommended)" "Another country" "Worldwide"
+    else
+        select_one "Where should packages be downloaded from?" "Another country" "Worldwide"
+    fi
+    case $SELECTED in
+        "Another country")
+            name=$(awk -F'\t' '!/^#/ {print $2 "|" $1}' /usr/share/zoneinfo/iso3166.tab | sort | gum filter --height 12 --placeholder "Type a country name") || exit 1
+            MIRROR_CODE=${name##*|}
+            MIRROR_NAME=${name%%|*} ;;
+        Worldwide)
+            MIRROR_CODE=""
+            MIRROR_NAME=Worldwide ;;
+        *)
+            MIRROR_CODE=$code
+            MIRROR_NAME=$name ;;
+    esac
+}
+
+write_mirrorlist() {
+    : > /etc/pacman.d/mirrorlist
+    if [ -n "$MIRROR_CODE" ]; then
+        curl -fsS --max-time 15 "https://archlinux.org/mirrorlist/?country=$MIRROR_CODE&protocol=https&ip_version=4&use_mirror_status=on" | sed 's/^#Server/Server/' | grep '^Server' | head -n 8 >> /etc/pacman.d/mirrorlist || true
+    fi
+    printf 'Server = https://geo.mirror.pkgbuild.com/$repo/os/$arch\n' >> /etc/pacman.d/mirrorlist
+}
+
+choose_desktop() {
+    title "Desktop shell"
+    gum style "The desktop shell is installed into /System. Its apps go to /Applications."
+    echo
+    hint "↑/↓ or W/S move  •  Enter select"
+    select_one "Choose your desktop shell" "KDE Plasma" "GNOME"
+    DESKTOP=$SELECTED
+    case $DESKTOP in
+        GNOME)
+            DE_PKGS="gnome-shell gdm gnome-control-center xdg-desktop-portal-gnome"
+            DE_BUNDLE_PKGS="nautilus gnome-console gnome-text-editor"
+            DM=gdm ;;
+        *)
+            DE_PKGS="plasma-desktop sddm plasma-nm plasma-pa kscreen xdg-desktop-portal-kde"
+            DE_BUNDLE_PKGS="dolphin konsole kate"
+            DM=sddm ;;
+    esac
+    DE_PKGS="$DE_PKGS networkmanager pipewire pipewire-pulse wireplumber"
+}
+
+app_packages() {
+    case $1 in
+        Firefox) echo firefox ;;
+        VLC) echo vlc ;;
+        LibreOffice) echo libreoffice-fresh ;;
+        GIMP) echo gimp ;;
+        Telegram) echo telegram-desktop ;;
+    esac
+}
+
+choose_apps() {
+    title "Applications"
+    gum style "Applications are installed into /Applications."
+    gum style "You can delete any of them later by removing its folder."
+    echo
+    hint "↑/↓ or W/S move  •  Space select  •  Enter confirm"
+    select_many "Select applications" -1 "Firefox" "VLC" "LibreOffice" "GIMP" "Telegram"
+    APPS=$SELECTED
+}
+
+live_disk() {
+    local src
+    src=$(findmnt -no SOURCE /run/medium 2>/dev/null || true)
+    if [ -n "$src" ]; then
+        lsblk -no PKNAME "$src" | head -n1
+    fi
+}
+
+choose_disk() {
+    title "Installation target"
+    local live name size model
+    local entries=()
+    live=/dev/$(live_disk)
+    while read -r name size model; do
+        if [ "$name" = "$live" ]; then
+            continue
+        fi
+        entries+=("$name  $size  $model")
+    done < <(lsblk -dnpo NAME,SIZE,MODEL -e 7,11)
+    if [ ${#entries[@]} -eq 0 ]; then
+        die "No disks found."
+    fi
+    hint "↑/↓ or W/S move  •  Enter select"
+    select_one "How should FasdeqOS be installed?" "Use free space on a disk" "Erase one disk" "Erase all disks (one shared pool)"
+    MODE=$SELECTED
+    DISKS=()
+    case $MODE in
+        "Erase all disks"*)
+            for e in "${entries[@]}"; do
+                DISKS+=("${e%% *}")
+            done ;;
+        *)
+            title "Disk"
+            hint "↑/↓ or W/S move  •  Enter select"
+            select_one "Select a disk" "${entries[@]}"
+            DISKS=("${SELECTED%% *}") ;;
+    esac
+}
+
+check_space() {
+    if [ "$MODE" = "Use free space on a disk" ]; then
+        local d=${DISKS[0]} free
+        if [ "$(blkid -p -s PTTYPE -o value "$d" 2>/dev/null || true)" != gpt ]; then
+            die "$d does not use a GPT partition table. Choose another option."
+        fi
+        free=$(parted -sm "$d" unit B print free | awk -F: '$5 ~ /^free/ {gsub("B","",$4); if ($4+0 > m) m=$4+0} END {printf "%d", m}')
+        if [ "$free" -lt 17179869184 ]; then
+            die "Less than 16 GiB of free space on $d."
+        fi
+    fi
+}
+
+ask_user() {
+    title "Your account"
+    HOST=$(gum input --prompt "Computer name: " --value fasdeqos) || exit 1
+    while :; do
+        USER_NAME=$(gum input --prompt "Username: " --placeholder "lowercase letters and digits") || exit 1
+        if [[ $USER_NAME =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            break
+        fi
+        gum style --foreground 196 "Use lowercase letters, digits, - and _ only."
+    done
+    while :; do
+        PASS=$(gum input --password --prompt "Password: ") || exit 1
+        PASS2=$(gum input --password --prompt "Repeat password: ") || exit 1
+        if [ -n "$PASS" ] && [ "$PASS" = "$PASS2" ]; then
+            break
+        fi
+        gum style --foreground 196 "Passwords are empty or do not match."
+    done
+}
+
+review() {
+    local apps=${APPS//$'\n'/, }
+    local rows
+    title "Review"
+    rows=$(printf '%s\n' \
+        "Field|Value" \
+        "Language|$LANG_NAME" \
+        "Keyboard|$LAYOUTS" \
+        "Layout switch|$COMBO" \
+        "Time zone|$TZ_NAME" \
+        "Mirror|$MIRROR_NAME" \
+        "Graphics|$GPU_NAMES" \
+        "Desktop|$DESKTOP" \
+        "Applications|${apps:-none}" \
+        "Disk|${DISKS[*]}" \
+        "Mode|$MODE" \
+        "Username|$USER_NAME" \
+        "Password|***" \
+        "Computer name|$HOST")
+    if ! printf '%s\n' "$rows" | gum table --print --separator "|" --widths 18,50; then
+        printf '%s\n' "$rows" | while IFS='|' read -r f v; do
+            printf '%-18s %s\n' "$f" "$v"
+        done
+    fi
+    echo
+    hint "←/→ or A/D move  •  Enter select"
+    confirm "Continue" "Change"
+}
+
+last_chance() {
+    title "Ready to install"
+    case $MODE in
+        "Use free space"*) gum style --foreground 214 "FasdeqOS will be installed into the free space on ${DISKS[0]}. Existing data is kept." ;;
+        "Erase one disk") gum style --foreground 214 "ALL DATA on ${DISKS[0]} will be erased." ;;
+        *) gum style --foreground 214 "ALL DATA on these disks will be erased: ${DISKS[*]}" ;;
+    esac
+    echo
+    hint "←/→ or A/D move  •  Enter select"
+    confirm "Install" "Exit" 1 || exit 1
+}
+
+add_gpu_pkgs() {
+    local p
+    for p in $1; do
+        case " $GPU_PKGS " in
+            *" $p "*) ;;
+            *) GPU_PKGS="$GPU_PKGS $p" ;;
+        esac
+    done
+}
+
+detect_gpu() {
+    local d class vendor device
+    GPU_PKGS="mesa lib32-mesa"
+    GPU_CMDLINE=""
+    GPU_NAMES=""
+    for d in /sys/bus/pci/devices/*; do
+        class=$(cat "$d/class" 2>/dev/null || true)
+        case $class in
+            0x03*) ;;
+            *) continue ;;
+        esac
+        vendor=$(cat "$d/vendor")
+        device=$(cat "$d/device")
+        case $vendor in
+            0x1002)
+                add_gpu_pkgs "vulkan-radeon lib32-vulkan-radeon libva-mesa-driver mesa-vdpau"
+                GPU_NAMES="${GPU_NAMES:+$GPU_NAMES, }AMD" ;;
+            0x8086)
+                add_gpu_pkgs "vulkan-intel lib32-vulkan-intel intel-media-driver"
+                GPU_NAMES="${GPU_NAMES:+$GPU_NAMES, }Intel" ;;
+            0x10de)
+                if [ $((device)) -ge $((0x1e00)) ]; then
+                    add_gpu_pkgs "nvidia-open nvidia-utils lib32-nvidia-utils nvidia-settings"
+                    GPU_CMDLINE="nvidia-drm.modeset=1"
+                    GPU_NAMES="${GPU_NAMES:+$GPU_NAMES, }NVIDIA (open driver)"
+                else
+                    add_gpu_pkgs "vulkan-nouveau lib32-vulkan-nouveau"
+                    GPU_NAMES="${GPU_NAMES:+$GPU_NAMES, }NVIDIA (nouveau)"
+                fi ;;
+        esac
+    done
+    GPU_NAMES=${GPU_NAMES:-Generic}
+}
+
+fix_shebangs() {
+    local f first rest pre
+    grep -rIl '^#!/bin/' "$1" 2>/dev/null | while IFS= read -r f; do
+        first=$(head -n1 "$f")
+        case $first in
+            "#!/bin/sh"|"#!/bin/sh "*|"#!/bin/bash"|"#!/bin/bash "*)
+                rest=$(printf '%s\n' "$first" | cut -c8-)
+                case $rest in
+                    *" "*) pre='#!/usr/bin/env -S ' ;;
+                    *) pre='#!/usr/bin/env ' ;;
+                esac
+                { printf '%s%s\n' "$pre" "$rest"; tail -n +2 "$f"; } > "$f.fix"
+                cat "$f.fix" > "$f"
+                rm -f "$f.fix" ;;
+        esac
+    done
+}
+
+prepare_keys() {
+    title "Preparing"
+    if [ ! -d /bin ]; then
+        mkdir -p /bin
+    fi
+    if ! mountpoint -q /bin; then
+        mount --bind /usr/bin /bin
+    fi
+    write_mirrorlist
+    if [ ! -d /etc/pacman.d/gnupg/private-keys-v1.d ]; then
+        pacman-key --init
+    fi
+    pacman-key --populate archlinux
+    pacman -Sy --noconfirm
+}
+
+partition() {
+    title "Partitioning"
+    local first=${DISKS[0]} n d
+    EXTRA=()
+    case $MODE in
+        "Use free space"*)
+            n=$(sgdisk -p "$first" | awk '$1 ~ /^[0-9]+$/ {m=$1} END {print m+0}')
+            BIOS_N=$((n + 1)); ESP_N=$((n + 2)); ROOT_N=$((n + 3))
+            sgdisk -n $BIOS_N:0:+1M -t $BIOS_N:ef02 -n $ESP_N:0:+512M -t $ESP_N:ef00 -n $ROOT_N:0:0 -t $ROOT_N:8300 "$first" ;;
+        *)
+            for d in "${DISKS[@]}"; do
+                wipefs -af "$d"
+                sgdisk --zap-all "$d"
+            done
+            BIOS_N=1; ESP_N=2; ROOT_N=3
+            sgdisk -n 1:0:+1M -t 1:ef02 -n 2:0:+512M -t 2:ef00 -n 3:0:0 -t 3:8300 "$first"
+            for d in "${DISKS[@]:1}"; do
+                sgdisk -n 1:0:0 -t 1:8300 "$d"
+                EXTRA+=("$(part "$d" 1)")
+            done ;;
+    esac
+    partprobe
+    udevadm settle
+    ESP_DEV=$(part "$first" $ESP_N)
+    ROOT_DEVS=("$(part "$first" $ROOT_N)" "${EXTRA[@]}")
+}
+
+format_disks() {
+    mkfs.fat -F32 -n EFI "$ESP_DEV"
+    if [ ${#ROOT_DEVS[@]} -gt 1 ]; then
+        mkfs.btrfs -f -L FasdeqOS -d single -m raid1 "${ROOT_DEVS[@]}"
+    else
+        mkfs.btrfs -f -L FasdeqOS "${ROOT_DEVS[0]}"
+    fi
+    udevadm settle
+    ROOT_UUID=$(blkid -s UUID -o value "${ROOT_DEVS[0]}")
+    ESP_UUID=$(blkid -s UUID -o value "$ESP_DEV")
+}
+
+mount_all() {
+    local v
+    mkdir -p "$TOP" /mnt
+    mount -o "$OPTS" "${ROOT_DEVS[0]}" "$TOP"
+    for v in root System Applications Library Users private; do
+        btrfs subvolume create "$TOP/$v"
+    done
+    umount "$TOP"
+    mount -o "$OPTS,subvol=root" "${ROOT_DEVS[0]}" /mnt
+    for v in System Applications Library Users private; do
+        mkdir -p "/mnt/$v"
+        mount -o "$OPTS,subvol=$v" "${ROOT_DEVS[0]}" "/mnt/$v"
+    done
+}
+
+install_base() {
+    title "Installing the system"
+    mkdir -p /var/cache/pacman/pkg /mnt/private/cache "$STAGE/boot"
+    mount --bind /mnt/private/cache /var/cache/pacman/pkg
+    mount "$ESP_DEV" "$STAGE/boot"
+    pacstrap -K "$STAGE" $BASE_PKGS $DE_PKGS $GPU_PKGS
+}
+
+configure() {
+    title "Configuring"
+    local l
+    printf '%s\n' "$HOST" > "$STAGE/etc/hostname"
+    : > "$STAGE/etc/fstab"
+    printf 'NAME="FasdeqOS"\nPRETTY_NAME="FasdeqOS"\nID=fasdeqos\nID_LIKE=arch\n' > "$STAGE/usr/lib/os-release"
+    printf '%s\n' /usr/bin/fish > "$STAGE/etc/shells"
+    mkdir -p "$STAGE/etc/fish" "$STAGE/etc/default" "$STAGE/etc/X11/xorg.conf.d" "$STAGE/etc/sudoers.d" "$STAGE/etc/initcpio/hooks" "$STAGE/etc/initcpio/install"
+    printf 'set -g fish_greeting\nset -gx PATH /usr/bin\n' > "$STAGE/etc/fish/config.fish"
+    printf 'SHELL=/usr/bin/fish\nHOME=/Users\n' > "$STAGE/etc/default/useradd"
+    mkdir -p "$STAGE/etc/tmpfiles.d" "$STAGE/etc/modules-load.d"
+    : > "$STAGE/etc/tmpfiles.d/home.conf"
+    : > "$STAGE/etc/tmpfiles.d/root.conf"
+    printf 'dm_mod\n' > "$STAGE/etc/modules-load.d/fasdeqos.conf"
+    cat > "$STAGE/etc/pacman.conf" <<'PACCONF'
+[options]
+HoldPkg = pacman glibc
+Architecture = auto
+CheckSpace
+ParallelDownloads = 5
+SigLevel = Required DatabaseOptional
+LocalFileSigLevel = Optional
+
+[core]
+Include = /etc/pacman.d/mirrorlist
+
+[extra]
+Include = /etc/pacman.d/mirrorlist
+
+[multilib]
+Include = /etc/pacman.d/mirrorlist
+PACCONF
+    rm -f "$STAGE"/etc/skel/.bash*
+    : > "$STAGE/etc/locale.gen"
+    for l in $LOCALES; do
+        printf '%s UTF-8\n' "$l" >> "$STAGE/etc/locale.gen"
+    done
+    printf 'LANG=%s\n' "$LANG_CODE" > "$STAGE/etc/locale.conf"
+    printf 'KEYMAP=%s\n' "$VCMAP" > "$STAGE/etc/vconsole.conf"
+    if [ -n "$FONT" ]; then
+        printf 'FONT=%s\n' "$FONT" >> "$STAGE/etc/vconsole.conf"
+    fi
+    cat > "$STAGE/etc/X11/xorg.conf.d/00-keyboard.conf" <<KBD
+Section "InputClass"
+    Identifier "keyboard"
+    MatchIsKeyboard "on"
+    Option "XkbLayout" "$LAYOUTS"
+    Option "XkbOptions" "$TOGGLE"
+EndSection
+KBD
+    cp "$SHARE/initcpio/hooks/fasdeqos-disk" "$STAGE/etc/initcpio/hooks/fasdeqos-disk"
+    cp "$SHARE/initcpio/install/fasdeqos-disk" "$STAGE/etc/initcpio/install/fasdeqos-disk"
+    cat > "$STAGE/etc/mkinitcpio.conf" <<'CONF'
+MODULES=(btrfs vfat dm_mod)
+BINARIES=(btrfs)
+FILES=()
+HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
+CONF
+    arch-chroot "$STAGE" locale-gen
+    arch-chroot "$STAGE" pacman-key --populate archlinux
+    cp /etc/pacman.d/mirrorlist "$STAGE/etc/pacman.d/mirrorlist"
+    arch-chroot "$STAGE" ln -sf "/usr/share/zoneinfo/$TZ_NAME" /etc/localtime
+    arch-chroot "$STAGE" mkinitcpio -P
+    rm -f "$STAGE"/boot/initramfs-linux-fallback.img
+    if [ -d /sys/firmware/efi ]; then
+        arch-chroot "$STAGE" grub-install --target=x86_64-efi --efi-directory=/boot --boot-directory=/boot --removable
+    fi
+    arch-chroot "$STAGE" grub-install --target=i386-pc --boot-directory=/boot "${DISKS[0]}" || true
+    cat > "$STAGE/boot/grub/grub.cfg" <<GRUBCFG
+set timeout=3
+set default=0
+menuentry "FasdeqOS" {
+    search --no-floppy --fs-uuid --set=root $ESP_UUID
+    linux /vmlinuz-linux root=UUID=$ROOT_UUID fasdeqos_esp=$ESP_UUID rw init=/System/lib/systemd/systemd firmware_class.path=/usr/lib/firmware $GPU_CMDLINE quiet
+    initrd /initramfs-linux.img
+}
+GRUBCFG
+    mkdir -p "$STAGE/Users"
+    arch-chroot "$STAGE" useradd -m -d "/Users/$USER_NAME" -s /usr/bin/fish -G wheel "$USER_NAME"
+    printf '%s:%s\n' "$USER_NAME" "$PASS" | arch-chroot "$STAGE" chpasswd
+    printf 'root:%s\n' "$PASS" | arch-chroot "$STAGE" chpasswd
+    printf '%%wheel ALL=(ALL:ALL) ALL\n' > "$STAGE/etc/sudoers.d/wheel"
+    chmod 440 "$STAGE/etc/sudoers.d/wheel"
+    cat > "$STAGE/etc/systemd/system/fasdeqos-ldconfig.service" <<'UNIT'
+[Unit]
+Description=Update shared library cache
+DefaultDependencies=no
+After=local-fs.target
+Before=sysinit.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/ldconfig
+
+[Install]
+WantedBy=sysinit.target
+UNIT
+    arch-chroot "$STAGE" systemctl enable NetworkManager "$DM" systemd-timesyncd systemd-resolved fasdeqos-ldconfig.service
+}
+
+install_bundles() {
+    local app p pkgs=""
+    for app in $APPS; do
+        pkgs="$pkgs $(app_packages "$app")"
+    done
+    mkdir -p /mnt/Library/Receipts
+    export PKG_APPS=/mnt/Applications PKG_RECEIPTS=/mnt/Library/Receipts PKG_SYSDB="$STAGE/var/lib/pacman/local" PKG_OWNER=1000:1000 PKG_NO_UNION=1
+    for p in $DE_BUNDLE_PKGS $pkgs; do
+        title "Installing $p"
+        pkg install "$p" || gum style --foreground 196 "$p could not be installed and was skipped."
+    done
+    chown 1000:1000 /mnt/Applications
+    chmod 775 /mnt/Applications
+}
+
+finalize() {
+    title "Finishing"
+    local p
+    umount "$STAGE/boot"
+    for p in $GNU_PKGS; do
+        if pacman -r "$STAGE" -Qq "$p" >/dev/null 2>&1; then
+            pacman -r "$STAGE" -Rdd --noconfirm "$p" || true
+        fi
+    done
+    bsdtar -xpf "$SHARE/payload.tar.zst" -C "$STAGE"
+    cp /usr/bin/pkg "$STAGE/usr/bin/pkg"
+    chmod +x "$STAGE/usr/bin/pkg"
+    fix_shebangs "$STAGE/usr"
+    mkdir -p "$STAGE/usr/lib/fasdeqos"
+    mv "$STAGE/usr/bin/pacman" "$STAGE/usr/lib/fasdeqos/pacman"
+    rm -rf "$STAGE/var/cache/pacman" "$STAGE/usr/share/libalpm" "$STAGE/usr/share/man" "$STAGE/usr/share/doc" "$STAGE/usr/share/info"
+}
+
+relayout() {
+    mkdir -p /mnt/Volumes /mnt/Library /mnt/usr /mnt/lib /mnt/lib64 /mnt/etc /mnt/var /mnt/tmp /mnt/System/Boot
+    printf '%s\n' usr bin lib lib64 etc var tmp private dev proc sys run > /mnt/.hidden
+    bsdtar -cpf - -C "$STAGE/usr" . | bsdtar -xpf - -C /mnt/System
+    rm -rf "$STAGE/usr"
+    bsdtar -cpf - -C "$STAGE/Users" . | bsdtar -xpf - -C /mnt/Users
+    rm -rf "$STAGE/Users"
+    mv "$STAGE/etc" /mnt/private/etc
+    mv "$STAGE/var" /mnt/private/var
+    mv "$STAGE/root" /mnt/private/var/root
+    mkdir -p /mnt/private/tmp
+    chmod 1777 /mnt/private/tmp
+    rm -rf "$STAGE"
+}
+
+finish() {
+    umount /bin 2>/dev/null || true
+    rmdir /bin 2>/dev/null || true
+    umount /var/cache/pacman/pkg
+    rm -rf /mnt/private/cache
+    umount -R /mnt
+    title "Done"
+    gum style "FasdeqOS is installed."
+    echo
+    hint "←/→ or A/D move  •  Enter select"
+    if confirm "Reboot" "Stay"; then
+        systemctl reboot
+    fi
+}
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "Run as root."
+    exit 1
+fi
+
+welcome
+check_network
+detect_gpu
+while :; do
+    choose_language
+    choose_keyboard
+    choose_timezone
+    choose_mirror
+    choose_desktop
+    choose_apps
+    choose_disk
+    check_space
+    ask_user
+    if review; then
+        break
+    fi
+done
+last_chance
+prepare_keys
+partition
+format_disks
+mount_all
+install_base
+configure
+install_bundles
+finalize
+relayout
+finish
