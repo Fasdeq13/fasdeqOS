@@ -253,6 +253,10 @@ LOG=${PKG_LOG:-/var/log/pkg-last.log}
 APPS=${PKG_APPS:-/Applications}
 LIBDIR=${PKG_LIBDIR:-/Library}
 RECEIPTS=$LIBDIR/Receipts
+PAC=/usr/lib/fasdeqos/pacman
+if [ ! -x "$PAC" ]; then
+    PAC=$(command -v pacman 2>/dev/null || echo pacman)
+fi
 VERBOSE=0
 args=""
 YES=0
@@ -348,14 +352,14 @@ drop_user_launchers() {
     done
 }
 local_name() {
-    pacman -Qip "$1" 2>/dev/null | sed -n 's/^Name *: *//p' | head -n1
+    "$PAC" -Qip "$1" 2>/dev/null | sed -n 's/^Name *: *//p' | head -n1
 }
 native_file() {
     f=$1
     p=$2
     nm=$(bundle_name "$p")
     bb=$APPS/$nm.pkg
-    PAC=/usr/lib/fasdeqos/pacman
+    PAC=${PAC:-/usr/lib/fasdeqos/pacman}
     if [ ! -x "$PAC" ]; then
         PAC=pacman
     fi
@@ -453,7 +457,7 @@ sys_run() {
     unshare -m sh -c 'mount --bind /System /usr || exit 97; if [ -d /System/opt ]; then mount --bind /System/opt /opt; fi; exec "$@"' sh "$@"
 }
 sys_pacman() {
-    sys_run /usr/bin/pacman "$@"
+    sys_run "$PAC" "$@"
 }
 ask() {
     if [ "$YES" -eq 1 ]; then
@@ -567,7 +571,7 @@ change_desktop() {
     current=""
     for d in $DE_LIST; do
         de_vars "$d"
-        if pacman -Qq "$DE_DETECT" >/dev/null 2>&1; then
+        if "$PAC" -Qq "$DE_DETECT" >/dev/null 2>&1; then
             current="$current $d"
         fi
     done
@@ -605,7 +609,7 @@ change_desktop() {
         list=""
         for item in $oldrm; do
             case $item in
-                @*) list="$list $(pacman -Qgq "${item#@}" 2>/dev/null)" ;;
+                @*) list="$list $("$PAC" -Qgq "${item#@}" 2>/dev/null)" ;;
                 *) list="$list $item" ;;
             esac
         done
@@ -618,12 +622,12 @@ change_desktop() {
             case " $keep " in
                 *" $item "*) continue ;;
             esac
-            if pacman -Qq "$item" >/dev/null 2>&1; then
+            if "$PAC" -Qq "$item" >/dev/null 2>&1; then
                 final="$final $item"
             fi
         done
         if [ -n "$final" ]; then
-            sys_run sh -c 'for pass in 1 2 3; do for p in "$@"; do /usr/bin/pacman -Rns --noconfirm "$p" >/dev/null 2>&1 || true; done; done' sh $final >>"$LOG" 2>&1 || true
+            sys_run sh -c 'pac=$1; shift; for pass in 1 2 3; do for p in "$@"; do "$pac" -Rns --noconfirm "$p" >/dev/null 2>&1 || true; done; done' sh "$PAC" $final >>"$LOG" 2>&1 || true
         fi
         if [ "$olddm" != "$newdm" ]; then
             systemctl disable "$olddm" >>"$LOG" 2>&1 || true
@@ -1155,10 +1159,10 @@ case $cmd in
         refresh
         exit $status ;;
     search)
-        pacman -Ss "$@" 2>/dev/null
+        "$PAC" -Ss "$@" 2>/dev/null
         exit 0 ;;
     info)
-        pacman -Si "$@" 2>/dev/null || pacman -Qi "$@" 2>/dev/null
+        "$PAC" -Si "$@" 2>/dev/null || "$PAC" -Qi "$@" 2>/dev/null
         exit 0 ;;
     list)
         : > "$LOG"
@@ -1177,6 +1181,27 @@ case $cmd in
     update|cleanup)
         run_real "$cmd" "$@"
         exit $? ;;
+    ""|help|-h|--help)
+        cat <<USAGE
+Usage: pkg <command> [arguments]
+
+  install <package|file> ...  Install applications (heavy ones go to containers)
+  uninstall <package> ...     Remove applications
+  list                        List installed applications
+  search <text>               Search available packages
+  info <package>              Show package details
+  update                      Refresh package databases
+  upgrade [package ...]       Upgrade the system and applications
+  list-repo                   List extra repositories
+  add-repo <url> [name]       Add a repository
+  remove-repo <name>          Remove a repository
+  kernel [list|use <name>]    Show or switch kernels
+  sys <pacman arguments>      Run pacman on the system volume
+  change-desktop <name>       Switch the desktop environment
+  change-int <name>           Switch chimerautils or busybox
+  cleanup                     Clear caches
+USAGE
+        exit 0 ;;
     *)
         raw_real "$cmd" "$@"
         exit $? ;;
@@ -1201,8 +1226,12 @@ function __pkg_repos
     end
 end
 function __pkg_available
-    command -q pacman; or return
-    pacman -Sl 2>/dev/null | string replace -r '^(\S+) (\S+).*' '$2\t$1'
+    set -l pm /usr/lib/fasdeqos/pacman
+    if not test -x $pm
+        set pm pacman
+    end
+    command -q $pm; or return
+    $pm -Sl 2>/dev/null | string replace -r '^(\S+) (\S+).*' '$2\t$1'
 end
 set -l __pkg_cmds install uninstall remove rm upgrade update cleanup search list info list-repo add-repo remove-repo compat check union sys kernel change-desktop change-int
 complete -c pkg -f
@@ -1302,6 +1331,7 @@ sync_kernel() {
     if ! mkinitcpio -c "$LIB/mkinitcpio-fasdeqos.conf" -k "$best" -g "$img" > "$LOGF" 2>&1 || [ ! -s "$img" ]; then
         rm -f "$img"
         printf 'Could not build the initramfs for %s. The previous kernel stays in use. Log: %s\n' "$best" "$LOGF"
+        tail -n 6 "$LOGF" 2>/dev/null
         return 1
     fi
     if ! ensure_mount "$ESP_MOUNT" "$ESP_UUID"; then
