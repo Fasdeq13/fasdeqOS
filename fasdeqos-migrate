@@ -86,6 +86,9 @@ bundle_name() {
 
 fix_shebangs() {
     local f first rest pre
+    if [ -L "$TOP/root/bin" ]; then
+        return 0
+    fi
     grep -rIl '^#!/bin/' "$1" 2>/dev/null | while IFS= read -r f; do
         first=$(head -n1 "$f")
         case $first in
@@ -446,7 +449,11 @@ container_install() {
         hook="$hook; printf '%s\\n' '$snip' >> /etc/pacman.conf"
     fi
     hook="$hook; pacman -Sy"
-    if ! as_user distrobox create --yes --name "$c" --image docker.io/library/archlinux:latest --pre-init-hooks "$hook" --additional-packages "base-devel git" >>"$LOG" 2>&1; then
+    nv=""
+    if [ -e /proc/driver/nvidia/version ]; then
+        nv=--nvidia
+    fi
+    if ! as_user distrobox create --yes $nv --name "$c" --image docker.io/library/archlinux:latest --pre-init-hooks "$hook" --additional-packages "base-devel git" >>"$LOG" 2>&1; then
         as_user distrobox rm --force "$c" >>"$LOG" 2>&1
         return 1
     fi
@@ -1573,6 +1580,9 @@ install_userland() {
     if [ "$USERLAND" = busybox ]; then
         bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr/bin/pkg
         install -m 755 /usr/bin/busybox "$sys/bin/busybox"
+        if [ -x /usr/bin/env ] && [ ! -L /usr/bin/env ]; then
+            install -m 755 /usr/bin/env "$sys/bin/env"
+        fi
         for a in $(/usr/bin/busybox --list); do
             if [ ! -e "$sys/bin/$a" ] && [ ! -L "$sys/bin/$a" ]; then
                 ln -s busybox "$sys/bin/$a"
