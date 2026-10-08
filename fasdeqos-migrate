@@ -11,6 +11,7 @@ TOP=/run/fasdeqos-top
 VOLUMES="root System Applications Library Users private"
 GNU_PKGS="coreutils grep sed findutils gawk diffutils gzip tar which"
 COMPAT_PKGS=${FASDEQOS_COMPAT:-"steam davinci-resolve davinci-resolve-studio"}
+HEAVY_PKGS=${FASDEQOS_HEAVY:-"steam blender davinci-resolve davinci-resolve-studio"}
 SNAPDIR=.fasdeqos-snapshots
 SNAPNAME=initial
 MODE=""
@@ -122,12 +123,6 @@ union_one() {
 if [ "$mode" = boot ] && [ "$(findmnt -no FSTYPE /usr)" = overlay ]; then
     exit 0
 fi
-while [ "$(findmnt -no FSTYPE /usr)" = overlay ]; do
-    umount -l /usr || break
-done
-while [ "$(findmnt -no FSTYPE /opt 2>/dev/null)" = overlay ]; do
-    umount -l /opt || break
-done
 union_one /usr /System usr
 union_one /opt /System/opt opt
 ldconfig 2>/dev/null
@@ -245,6 +240,22 @@ tool_pkg() {
 if [ "$(id -u)" -ne 0 ]; then
     exec sudo "$0" "$@"
 fi
+BIN=${FASDEQOS_BIN:-/usr/bin}
+REAL=${PKG_REAL:-$BIN/pkg-real}
+LOG=${PKG_LOG:-/var/log/pkg-last.log}
+APPS=${PKG_APPS:-/Applications}
+LIBDIR=${PKG_LIBDIR:-/Library}
+RECEIPTS=$LIBDIR/Receipts
+VERBOSE=0
+args=""
+for a in "$@"; do
+    if [ "$a" = --verbose ]; then
+        VERBOSE=1
+    else
+        args="$args $a"
+    fi
+done
+set -- $args
 bundle_name() {
     case $1 in
         vlc) echo VLC ;;
@@ -260,52 +271,334 @@ bundle_name() {
             echo "$first$rest" ;;
     esac
 }
+user=${SUDO_USER:-}
+home=""
+if [ -n "$user" ]; then
+    home=$(getent passwd "$user" | cut -d: -f6)
+fi
+as_user() {
+    runuser -u "$user" -- env HOME="$home" XDG_RUNTIME_DIR="/run/user/$(id -u "$user")" "$@"
+}
+containers_ok() {
+    [ -n "$user" ] && command -v distrobox >/dev/null 2>&1 && command -v podman >/dev/null 2>&1
+}
+REPODIR=$LIBDIR/Repos
+valid_word() {
+    case $1 in
+        ""|*[!A-Za-z0-9._-]*) return 1 ;;
+    esac
+    return 0
+}
+valid_url() {
+    case $1 in
+        http://*|https://*) ;;
+        *) return 1 ;;
+    esac
+    case $1 in
+        *[!A-Za-z0-9._~:/?@\&$+,=%-]*) return 1 ;;
+    esac
+    return 0
+}
+repo_snippet() {
+    for f in "$REPODIR"/*.repo; do
+        if [ ! -f "$f" ]; then
+            continue
+        fi
+        n=$(basename "$f" .repo)
+        u=$(head -n1 "$f")
+        printf '[%s]\nSigLevel = Optional TrustAll\nServer = %s\n' "$n" "$u"
+    done
+}
+sync_repos() {
+    mkdir -p "$REPODIR"
+    conf=${PKG_PACMAN_CONF:-/etc/pacman.conf}
+    extra=$(dirname "$conf")/pacman.d/fasdeqos-repos.conf
+    if [ -d "$(dirname "$extra")" ]; then
+        repo_snippet > "$extra"
+        if [ -f "$conf" ] && ! grep -q 'fasdeqos-repos.conf' "$conf"; then
+            printf '\nInclude = %s\n' "$extra" >> "$conf"
+        fi
+    fi
+}
+place_desktop() {
+    b=$1
+    ad=$b/usr/share/applications
+    if [ ! -d "$ad" ]; then
+        return 0
+    fi
+    for d in "$ad"/*.desktop; do
+        if [ ! -f "$d" ] || [ -L "$d" ]; then
+            continue
+        fi
+        bn=$(basename "$d")
+        mv "$d" "$b/$bn"
+        ln -s "$b/$bn" "$ad/$bn"
+    done
+    return 0
+}
+field() {
+    sed -n "s/^$2=//p" "$1"
+}
+raw_real() {
+    PKG_NO_UNION=1 "$REAL" "$@"
+}
+run_real() {
+    if [ "$VERBOSE" -eq 1 ]; then
+        raw_real "$@"
+        return $?
+    fi
+    rcf=$(mktemp /tmp/pkg-rc.XXXXXX)
+    { raw_real "$@"; echo $? > "$rcf"; } 2>&1 | tee -a "$LOG" | grep -E '^(==>|Error:|.*is already installed|.*is not installed|.*is part of the system)' || true
+    rc=$(cat "$rcf")
+    rm -f "$rcf"
+    if [ "$rc" -ne 0 ]; then
+        printf 'Something went wrong. Run the command again with --verbose or see %s\n' "$LOG"
+    fi
+    return "$rc"
+}
+refresh() {
+    sh "$BIN/fasdeqos-union" >>"$LOG" 2>&1 || true
+}
+after_native() {
+    for p in "$@"; do
+        name=$(bundle_name "$p")
+        if [ -d "$APPS/$name.pkg" ]; then
+            place_desktop "$APPS/$name.pkg"
+        fi
+    done
+    for p in "$@"; do
+        name=$(bundle_name "$p")
+        if [ ! -d "$APPS/$name.pkg" ]; then
+            continue
+        fi
+        if grep -qx "$p" "$LIBDIR/compat.list" 2>/dev/null; then
+            sh "$BIN/fasdeqos-compat" "$name" >>"$LOG" 2>&1 || true
+        fi
+    done
+    refresh
+    for p in "$@"; do
+        name=$(bundle_name "$p")
+        if [ ! -d "$APPS/$name.pkg" ]; then
+            continue
+        fi
+        if ! sh "$BIN/fasdeqos-libcheck" "$name" >>"$LOG" 2>&1; then
+            printf 'Note: %s may need extra libraries. Details: %s\n' "$name" "$LOG"
+        fi
+    done
+}
+container_install() {
+    p=$1
+    name=$(bundle_name "$p")
+    b=$APPS/$name.pkg
+    c=fasdeqos-$p
+    if [ -d "$b" ]; then
+        printf '%s is already installed.\n' "$name"
+        return 0
+    fi
+    printf '==> Installing %s in its own container (the first time takes a while)\n' "$name"
+    hook="sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf"
+    snip=$(repo_snippet)
+    if [ -n "$snip" ]; then
+        hook="$hook; printf '%s\\n' '$snip' >> /etc/pacman.conf"
+    fi
+    hook="$hook; pacman -Sy"
+    if ! as_user distrobox create --yes --name "$c" --image docker.io/library/archlinux:latest --pre-init-hooks "$hook" --additional-packages "$p" >>"$LOG" 2>&1; then
+        return 1
+    fi
+    if ! as_user distrobox enter --name "$c" -- true >>"$LOG" 2>&1; then
+        as_user distrobox rm --force "$c" >>"$LOG" 2>&1
+        return 1
+    fi
+    tmp=$(mktemp -d /tmp/pkg-export.XXXXXX)
+    chown "$user" "$tmp"
+    cat > "$tmp/export.sh" <<'EXPORT'
+p=$1
+out=$2
+pacman -Qlq "$p" | while IFS= read -r f; do
+    case $f in
+        /usr/bin/?*)
+            if [ -f "$f" ] || [ -L "$f" ]; then
+                basename "$f" >> "$out/bin.list"
+            fi ;;
+        /usr/share/applications/*.desktop)
+            cp "$f" "$out/" ;;
+        /usr/share/icons/*|/usr/share/pixmaps/*)
+            if [ -f "$f" ]; then
+                mkdir -p "$out/files$(dirname "$f")"
+                cp "$f" "$out/files$(dirname "$f")/"
+            fi ;;
+    esac
+done
+exit 0
+EXPORT
+    as_user distrobox enter --name "$c" -- sh "$tmp/export.sh" "$p" "$tmp" >>"$LOG" 2>&1
+    mkdir -p "$b/usr/bin" "$b/usr/share/applications"
+    if [ -f "$tmp/bin.list" ]; then
+        while read -r bn; do
+            if [ -e "/System/bin/$bn" ]; then
+                continue
+            fi
+            printf '#!/usr/bin/env sh\nexec distrobox-enter --name %s -- /usr/bin/%s "$@"\n' "$c" "$bn" > "$b/usr/bin/$bn"
+            chmod +x "$b/usr/bin/$bn"
+        done < "$tmp/bin.list"
+    fi
+    for d in "$tmp"/*.desktop; do
+        if [ ! -f "$d" ]; then
+            continue
+        fi
+        sed -e '/^TryExec=/d' -e "s|^Exec=|Exec=distrobox-enter --name $c -- |" "$d" > "$b/usr/share/applications/$(basename "$d")"
+    done
+    place_desktop "$b"
+    if [ -d "$tmp/files/usr" ]; then
+        cp -a "$tmp/files/usr/." "$b/usr/"
+    fi
+    printf '%s\n' "$c" > "$b/container"
+    chmod -R a+rX "$b"
+    rm -rf "$tmp"
+    mkdir -p "$RECEIPTS"
+    printf 'bundle=%s\nrequested=%s\npackages=%s\nstate=installed\ncontainer=%s\n' "$name" "$p" "$p" "$c" > "$RECEIPTS/$name.receipt"
+    printf '==> Installed %s\n' "$name"
+    return 0
+}
 cmd=${1:-}
+if [ $# -gt 0 ]; then
+    shift
+fi
 case $cmd in
     union)
-        /usr/bin/sh /usr/bin/fasdeqos-union
+        refresh
         exit 0 ;;
     compat)
-        shift
         for p in "$@"; do
-            /usr/bin/sh /usr/bin/fasdeqos-compat "$(bundle_name "$p")"
+            sh "$BIN/fasdeqos-compat" "$(bundle_name "$p")"
         done
-        /usr/bin/sh /usr/bin/fasdeqos-union
+        refresh
         exit 0 ;;
     check)
-        shift
         for p in "$@"; do
-            /usr/bin/sh /usr/bin/fasdeqos-libcheck "$(bundle_name "$p")"
+            sh "$BIN/fasdeqos-libcheck" "$(bundle_name "$p")"
         done
         exit 0 ;;
-esac
-PKG_NO_UNION=1 /usr/bin/pkg-real "$@"
-rc=$?
-case $cmd in
-    install|uninstall|remove|rm|upgrade)
-        shift
+    list-repo|list-repos)
+        n=0
+        for f in "$REPODIR"/*.repo; do
+            if [ ! -f "$f" ]; then
+                continue
+            fi
+            printf '%s  %s\n' "$(basename "$f" .repo)" "$(head -n1 "$f")"
+            n=$((n + 1))
+        done
+        if [ "$n" -eq 0 ]; then
+            printf 'No extra repositories. Add one with: pkg add-repo <url>\n'
+        fi
+        exit 0 ;;
+    add-repo)
+        url=${1:-}
+        if ! valid_url "$url"; then
+            printf 'Usage: pkg add-repo <http(s)://url> [name]\n'
+            exit 1
+        fi
+        name=${2:-}
+        if [ -z "$name" ]; then
+            name=$(printf '%s' "$url" | sed -e 's|/*$||' -e 's|/os/.*$||' -e 's|/\$repo.*$||' -e 's|.*/||' -e 's|\.git$||' -e 's|[^A-Za-z0-9._-]|-|g')
+        fi
+        if ! valid_word "$name"; then
+            printf 'Could not pick a name, pass one: pkg add-repo <url> <name>\n'
+            exit 1
+        fi
+        mkdir -p "$REPODIR"
+        printf '%s\n' "$url" > "$REPODIR/$name.repo"
+        sync_repos
+        printf 'Repository %s added.\n' "$name"
+        exit 0 ;;
+    remove-repo)
+        name=${1:-}
+        if ! valid_word "$name" || [ ! -f "$REPODIR/$name.repo" ]; then
+            printf 'No such repository. See: pkg list-repo\n'
+            exit 1
+        fi
+        rm -f "$REPODIR/$name.repo"
+        sync_repos
+        printf 'Repository %s removed.\n' "$name"
+        exit 0 ;;
+    install)
+        : > "$LOG"
+        sync_repos
+        status=0
+        native=""
+        for p in "$@"; do
+            case $p in
+                -*) continue ;;
+            esac
+            if containers_ok; then
+                if ! container_install "$p"; then
+                    printf 'The container install failed, installing %s the regular way.\n' "$p"
+                    native="$native $p"
+                fi
+            else
+                native="$native $p"
+            fi
+        done
+        if [ -n "$native" ]; then
+            run_real install $native || status=1
+            after_native $native
+        else
+            refresh
+        fi
+        exit $status ;;
+    uninstall|remove|rm)
+        : > "$LOG"
         for p in "$@"; do
             case $p in
                 -*) continue ;;
             esac
             name=$(bundle_name "$p")
-            if [ "$cmd" = install ] && [ -d "/Applications/$name.pkg" ]; then
-                if grep -qx "$p" /Library/compat.list 2>/dev/null; then
-                    /usr/bin/sh /usr/bin/fasdeqos-compat "$name"
-                fi
+            if [ -f "$APPS/$name.pkg/container" ] && [ -n "$user" ]; then
+                as_user distrobox rm --force "$(cat "$APPS/$name.pkg/container")" >>"$LOG" 2>&1 || true
             fi
         done
-        /usr/bin/sh /usr/bin/fasdeqos-union
-        if [ "$cmd" = install ] || [ "$cmd" = upgrade ]; then
+        run_real uninstall "$@"
+        rc=$?
+        refresh
+        exit $rc ;;
+    upgrade)
+        : > "$LOG"
+        names=""
+        if [ $# -gt 0 ]; then
             for p in "$@"; do
-                case $p in
-                    -*) continue ;;
-                esac
-                /usr/bin/sh /usr/bin/fasdeqos-libcheck "$(bundle_name "$p")" || true
+                names="$names $(bundle_name "$p")"
             done
-        fi ;;
+        else
+            for r in "$RECEIPTS"/*.receipt; do
+                if [ -f "$r" ]; then
+                    names="$names $(basename "$r" .receipt)"
+                fi
+            done
+        fi
+        status=0
+        for name in $names; do
+            r=$RECEIPTS/$name.receipt
+            if [ ! -f "$r" ]; then
+                printf '%s is not installed.\n' "$name"
+                continue
+            fi
+            c=$(field "$r" container)
+            if [ -n "$c" ]; then
+                printf '==> Upgrading %s\n' "$name"
+                as_user distrobox upgrade --name "$c" >>"$LOG" 2>&1 || status=1
+            else
+                run_real upgrade "$(field "$r" requested)" || status=1
+            fi
+        done
+        refresh
+        exit $status ;;
+    update|cleanup)
+        run_real "$cmd" "$@"
+        exit $? ;;
+    *)
+        raw_real "$cmd" "$@"
+        exit $? ;;
 esac
-exit $rc
 PKGW
 }
 
@@ -370,7 +663,7 @@ fasdeqos_disk_mount_handler() {
         umount "$newroot/usr" 2>/dev/null
         mount --bind "$newroot/System" "$newroot/usr" || klog "bind /usr failed"
     fi
-    for m in "usr/lib lib" "usr/lib lib64" "private/etc etc" "private/var var" "private/tmp tmp"; do
+    for m in "private/etc etc" "private/var var" "private/tmp tmp"; do
         set -- $m
         mount --bind "$newroot/$1" "$newroot/$2" || klog "bind $1 to $2 failed"
     done
@@ -379,15 +672,8 @@ fasdeqos_disk_mount_handler() {
         mount --bind "$newroot/usr/opt" "$newroot/opt"
     fi
     echo /usr/bin/modprobe > /proc/sys/kernel/modprobe
-    mkdir -p "$newroot/bin"
-    for n in sh bash env login; do
-        if [ -e "$newroot/usr/bin/$n" ]; then
-            : > "$newroot/bin/$n"
-            mount --bind "$newroot/usr/bin/$n" "$newroot/bin/$n"
-        fi
-    done
     if [ "${fasdeqos_sealed:-0}" = 1 ]; then
-        for t in System usr lib lib64 opt bin/sh bin/bash bin/env bin/login; do
+        for t in System usr opt; do
             if [ -e "$newroot/$t" ]; then
                 mount -o remount,bind,ro "$newroot/$t" 2>/dev/null
             fi
@@ -447,6 +733,10 @@ write_tools() {
     : > "$TOP/Library/compat.list"
     for p in $COMPAT_PKGS; do
         printf '%s\n' "$p" >> "$TOP/Library/compat.list"
+    done
+    : > "$TOP/Library/heavy.list"
+    for p in $HEAVY_PKGS; do
+        printf '%s\n' "$p" >> "$TOP/Library/heavy.list"
     done
     mkdir -p "$priv/etc/systemd/system/sysinit.target.wants"
     cat > "$priv/etc/systemd/system/fasdeqos-union.service" <<'UNIT'
@@ -682,7 +972,7 @@ prepare() {
     if [ "$USERLAND" = busybox ]; then
         extra=busybox
     fi
-    pacman -S --needed --noconfirm fish libarchive zstd mkinitcpio btrfs-progs curl pacman-contrib util-linux $extra
+    pacman -S --needed --noconfirm fish libarchive zstd mkinitcpio btrfs-progs curl pacman-contrib util-linux podman distrobox $extra
     UUID=$(blkid -s UUID -o value "$DEV")
     ESP_UUID=$(blkid -s UUID -o value "$ESP_DEV")
     if [ "$MODE" = clean ] && [ "$(findmnt -no TARGET -T /boot)" = "/" ]; then
@@ -738,9 +1028,13 @@ copy_files() {
     fi
     mkdir -p "$TOP/private/tmp" "$TOP/Library/Receipts"
     chmod 1777 "$TOP/private/tmp"
-    for d in System Applications Library Users private Volumes usr lib lib64 etc var tmp; do
+    for d in System Applications Library Users private Volumes usr etc var tmp; do
         mkdir -p "$TOP/root/$d"
     done
+    ln -sfn usr/lib "$TOP/root/lib"
+    ln -sfn usr/lib "$TOP/root/lib64"
+    ln -sfn usr/bin "$TOP/root/bin"
+    ln -sfn usr/bin "$TOP/root/sbin"
 }
 
 save_gnu() {
@@ -758,6 +1052,9 @@ save_gnu() {
             esac
         done < <(pacman -Qlq "$p")
     done
+    if [ -x /usr/bin/getopt ]; then
+        cp -a /usr/bin/getopt "$dst/bin/"
+    fi
 }
 
 remove_gnu() {
@@ -904,6 +1201,9 @@ install_userland() {
         done
     else
         bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr
+        if [ -x /usr/bin/getopt ]; then
+            cp -a /usr/bin/getopt "$sys/bin/getopt"
+        fi
         if [ -x "$sys/bin/bsdtar" ] && [ ! -e "$sys/bin/tar" ]; then
             cp "$sys/bin/bsdtar" "$sys/bin/tar"
         fi
@@ -912,6 +1212,18 @@ install_userland() {
     if [ -e "$sys/bin/pacman" ]; then
         mv "$sys/bin/pacman" "$sys/lib/fasdeqos/pacman"
     fi
+}
+
+setup_subids() {
+    local u f
+    u=$(awk -F: '$3 >= 1000 && $3 < 60000 {print $1; exit}' /etc/passwd)
+    [ -n "$u" ] || return 0
+    for f in subuid subgid; do
+        touch "$TOP/private/etc/$f"
+        if ! grep -q "^$u:" "$TOP/private/etc/$f"; then
+            printf '%s:100000:65536\n' "$u" >> "$TOP/private/etc/$f"
+        fi
+    done
 }
 
 convert() {
@@ -927,10 +1239,11 @@ convert() {
     printf 'set -g fish_greeting\nset -gx PATH /usr/bin\n' > "$priv/etc/fish/config.fish"
     sed -i 's#:/home/#:/Users/#; s#:/usr/bin/bash$#:/usr/bin/fish#; s#:/bin/bash$#:/usr/bin/fish#' "$priv/etc/passwd"
     grep -qx /usr/bin/fish "$priv/etc/shells" || echo /usr/bin/fish >> "$priv/etc/shells"
-    printf 'usr\nbin\nlib\nlib64\nopt\netc\nvar\ntmp\nprivate\ndev\nproc\nsys\nrun\n' > "$TOP/root/.hidden"
+    printf 'usr\nbin\nsbin\nlib\nlib64\nopt\netc\nvar\ntmp\nprivate\ndev\nproc\nsys\nrun\n' > "$TOP/root/.hidden"
     fix_shebangs "$sys"
     write_os_release
     write_tools
+    setup_subids
 }
 
 make_snapshots() {
@@ -1290,14 +1603,14 @@ purge_now() {
         fi
         return 0
     fi
+    printf '==> The old system will be deleted now and the computer reboots into FasdeqOS. Press Ctrl+C within 10 seconds to cancel.\n'
+    read -r -t 10 _ || true
     sync
     echo 1 > /proc/sys/kernel/sysrq
     exec 3>/proc/sysrq-trigger
     cleanup
     trap - EXIT
     if btrfs subvolume delete --recursive "$TOP/$rootsub" >/dev/null 2>&1; then
-        printf '==> The old system is deleted. Rebooting into FasdeqOS in 10 seconds.\n'
-        read -r -t 10 _ || true
         echo s >&3
         echo u >&3
         echo b >&3
