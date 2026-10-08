@@ -86,9 +86,6 @@ bundle_name() {
 
 fix_shebangs() {
     local f first rest pre
-    if [ -L "$TOP/root/bin" ]; then
-        return 0
-    fi
     grep -rIl '^#!/bin/' "$1" 2>/dev/null | while IFS= read -r f; do
         first=$(head -n1 "$f")
         case $first in
@@ -258,9 +255,12 @@ LIBDIR=${PKG_LIBDIR:-/Library}
 RECEIPTS=$LIBDIR/Receipts
 VERBOSE=0
 args=""
+YES=0
 for a in "$@"; do
     if [ "$a" = --verbose ]; then
         VERBOSE=1
+    elif [ "$a" = --yes ] || [ "$a" = -y ]; then
+        YES=1
     else
         args="$args $a"
     fi
@@ -294,6 +294,100 @@ containers_ok() {
 }
 is_heavy() {
     grep -qx "$1" "$LIBDIR/heavy.list" 2>/dev/null
+}
+IMAGE=${PKG_IMAGE:-docker.io/cachyos/cachyos:latest}
+only_container() {
+    case $1 in
+        steam) return 0 ;;
+    esac
+    return 1
+}
+export_user_launchers() {
+    nm=$1
+    bb=$APPS/$nm.pkg
+    if [ -z "$home" ] || [ ! -d "$bb" ]; then
+        return 0
+    fi
+    ud=$home/.local/share/applications
+    mkdir -p "$ud"
+    for d in "$bb"/*.desktop; do
+        if [ ! -f "$d" ]; then
+            continue
+        fi
+        bn=$(basename "$d")
+        icon=$(sed -n 's/^Icon=//p' "$d" | head -n1)
+        iconpath=""
+        case $icon in
+            ""|/*) ;;
+            *)
+                iconpath=$(find "$bb/usr/share/icons" "$bb/usr/share/pixmaps" \( -name "$icon.png" -o -name "$icon.svg" -o -name "$icon.xpm" \) 2>/dev/null | sort -r | head -n1) ;;
+        esac
+        {
+            printf '[Desktop Entry]\nX-FasdeqOS-Bundle=%s\n' "$nm"
+            if [ -n "$iconpath" ]; then
+                sed -n '/^\[Desktop Entry\]/,$p' "$d" | sed -e '1d' -e "s|^Icon=.*|Icon=$iconpath|"
+            else
+                sed -n '/^\[Desktop Entry\]/,$p' "$d" | sed '1d'
+            fi
+        } > "$ud/fasdeqos-$bn"
+        chown "$user" "$ud/fasdeqos-$bn"
+    done
+    chown "$user" "$ud"
+    as_user update-desktop-database "$ud" >/dev/null 2>&1 || true
+    as_user kbuildsycoca6 >/dev/null 2>&1 || true
+}
+drop_user_launchers() {
+    for f in /Users/*/.local/share/applications/fasdeqos-*.desktop; do
+        if [ ! -f "$f" ]; then
+            continue
+        fi
+        bn=$(sed -n 's/^X-FasdeqOS-Bundle=//p' "$f" | head -n1)
+        if [ -n "$bn" ] && [ ! -d "$APPS/$bn.pkg" ]; then
+            rm -f "$f"
+        fi
+    done
+}
+local_name() {
+    pacman -Qip "$1" 2>/dev/null | sed -n 's/^Name *: *//p' | head -n1
+}
+native_file() {
+    f=$1
+    p=$2
+    nm=$(bundle_name "$p")
+    bb=$APPS/$nm.pkg
+    PAC=/usr/lib/fasdeqos/pacman
+    if [ ! -x "$PAC" ]; then
+        PAC=pacman
+    fi
+    if [ -d "$bb" ]; then
+        printf '%s is already installed.\n' "$nm"
+        return 0
+    fi
+    printf '==> Installing %s\n' "$nm"
+    mkdir -p "$bb/.db/sync" "$bb/.db/own"
+    rm -rf "$bb/.db/local"
+    cp -R /var/lib/pacman/local "$bb/.db/local"
+    cp /var/lib/pacman/sync/* "$bb/.db/sync/" 2>/dev/null || true
+    before=$(mktemp /tmp/pkg.XXXXXX)
+    after=$(mktemp /tmp/pkg.XXXXXX)
+    ls "$bb/.db/local" | sort > "$before"
+    if ! "$PAC" -r "$bb" --dbpath "$bb/.db" --cachedir /var/cache/pacman/pkg --gpgdir /etc/pacman.d/gnupg --logfile /var/log/pkg.log --noscriptlet --noconfirm --needed -U "$f" >>"$LOG" 2>&1; then
+        rm -rf "$bb" "$before" "$after"
+        return 1
+    fi
+    ls "$bb/.db/local" | sort > "$after"
+    names=""
+    for d in $(comm -13 "$before" "$after"); do
+        cp -R "$bb/.db/local/$d" "$bb/.db/own/$d"
+        names="$names $(sed -n '2p' "$bb/.db/own/$d/desc")"
+    done
+    rm -f "$before" "$after"
+    rm -rf "$bb/.db/sync"
+    mkdir -p "$RECEIPTS"
+    printf 'bundle=%s\nrequested=%s\npackages=%s\nstate=installed\n' "$nm" "$p" "$names" > "$RECEIPTS/$nm.receipt"
+    chown -R "${SUDO_UID:-0}:${SUDO_GID:-0}" "$bb"
+    printf '==> Installed %s\n' "$nm"
+    return 0
 }
 REPODIR=$LIBDIR/Repos
 valid_word() {
@@ -355,8 +449,288 @@ is_system() {
     esac
     return 1
 }
+sys_run() {
+    unshare -m sh -c 'mount --bind /System /usr || exit 97; if [ -d /System/opt ]; then mount --bind /System/opt /opt; fi; exec "$@"' sh "$@"
+}
 sys_pacman() {
-    unshare -m sh -c 'mount --bind /System /usr || exit 97; if [ -d /System/opt ]; then mount --bind /System/opt /opt; fi; exec /usr/bin/pacman "$@"' sh "$@"
+    sys_run /usr/bin/pacman "$@"
+}
+ask() {
+    if [ "$YES" -eq 1 ]; then
+        return 0
+    fi
+    printf '%s [y/N] ' "$1"
+    read -r ans
+    case $ans in
+        y|Y|yes|Yes) return 0 ;;
+    esac
+    return 1
+}
+sys_pending=""
+reconcile() {
+    sys_pending=""
+    for r in "$RECEIPTS"/*.receipt; do
+        if [ ! -f "$r" ]; then
+            continue
+        fi
+        n=$(basename "$r" .receipt)
+        req=$(field "$r" requested)
+        c=$(field "$r" container)
+        if [ ! -d "$APPS/$n.pkg" ]; then
+            if [ -n "$c" ] && [ -n "$user" ]; then
+                as_user distrobox rm --force "$c" >>"$LOG" 2>&1 || true
+            fi
+            rm -f "$r"
+            continue
+        fi
+        if [ -n "$req" ] && is_system "$req"; then
+            rm -rf "$APPS/$n.pkg"
+            rm -f "$r"
+            sys_pending="$sys_pending $req"
+        fi
+    done
+    if [ -n "$sys_pending" ]; then
+        printf '==> Moving system packages out of /Applications:%s\n' "$sys_pending"
+        run_sys -S --needed --noconfirm $sys_pending || true
+    fi
+    drop_user_launchers
+    refresh
+}
+de_vars() {
+    DE_PKGS=""
+    DE_DM=""
+    DE_DETECT=""
+    DE_RM=""
+    DE_CFG=""
+    case $1 in
+        plasma)
+            DE_PKGS="plasma-desktop plasma-nm plasma-pa kscreen konsole dolphin sddm"
+            DE_DM=sddm
+            DE_DETECT=plasma-desktop
+            DE_RM="@plasma"
+            DE_CFG=".config/plasma* .config/kwinrc .config/kdeglobals .config/kscreenlockerrc .local/share/plasma .cache/plasma*" ;;
+        gnome)
+            DE_PKGS="gnome gdm"
+            DE_DM=gdm
+            DE_DETECT=gnome-shell
+            DE_RM="@gnome"
+            DE_CFG=".config/gnome-* .local/share/gnome-shell" ;;
+        cosmic)
+            DE_PKGS="cosmic"
+            DE_DM=cosmic-greeter
+            DE_DETECT=cosmic-session
+            DE_RM="@cosmic"
+            DE_CFG=".config/cosmic .local/state/cosmic" ;;
+        hyprland)
+            DE_PKGS="hyprland kitty waybar wofi xdg-desktop-portal-hyprland sddm"
+            DE_DM=sddm
+            DE_DETECT=hyprland
+            DE_RM="hyprland waybar wofi xdg-desktop-portal-hyprland"
+            DE_CFG=".config/hypr .config/waybar .config/wofi" ;;
+        niri)
+            DE_PKGS="niri alacritty fuzzel waybar xdg-desktop-portal-gnome sddm"
+            DE_DM=sddm
+            DE_DETECT=niri
+            DE_RM="niri fuzzel waybar"
+            DE_CFG=".config/niri .config/fuzzel .config/waybar" ;;
+        xfce)
+            DE_PKGS="xfce4 xfce4-goodies lightdm lightdm-gtk-greeter"
+            DE_DM=lightdm
+            DE_DETECT=xfce4-session
+            DE_RM="@xfce4 @xfce4-goodies"
+            DE_CFG=".config/xfce4" ;;
+        cinnamon)
+            DE_PKGS="cinnamon lightdm lightdm-gtk-greeter"
+            DE_DM=lightdm
+            DE_DETECT=cinnamon
+            DE_RM="cinnamon"
+            DE_CFG=".config/cinnamon" ;;
+        mate)
+            DE_PKGS="mate mate-extra lightdm lightdm-gtk-greeter"
+            DE_DM=lightdm
+            DE_DETECT=mate-session-manager
+            DE_RM="@mate @mate-extra"
+            DE_CFG=".config/mate" ;;
+        lxqt)
+            DE_PKGS="lxqt sddm"
+            DE_DM=sddm
+            DE_DETECT=lxqt-session
+            DE_RM="@lxqt"
+            DE_CFG=".config/lxqt" ;;
+        *) return 1 ;;
+    esac
+    return 0
+}
+DE_LIST="plasma gnome cosmic hyprland niri xfce cinnamon mate lxqt"
+change_desktop() {
+    want=${1:-}
+    current=""
+    for d in $DE_LIST; do
+        de_vars "$d"
+        if pacman -Qq "$DE_DETECT" >/dev/null 2>&1; then
+            current="$current $d"
+        fi
+    done
+    if ! de_vars "$want"; then
+        printf 'Usage: pkg change-desktop <name>\nAvailable: %s\nInstalled now:%s\n' "$DE_LIST" "${current:- none}"
+        return 1
+    fi
+    sys_writable || return 1
+    newpkgs=$DE_PKGS
+    newdm=$DE_DM
+    newcfg=$DE_CFG
+    olds=""
+    for d in $current; do
+        if [ "$d" != "$want" ]; then
+            olds="$olds $d"
+        fi
+    done
+    printf 'This will install %s and remove:%s\nSettings of the removed desktops are deleted too.\n' "$want" "${olds:- nothing}"
+    if ! ask 'Continue?'; then
+        return 1
+    fi
+    : > "$LOG"
+    printf '==> Installing %s (this takes a while)\n' "$want"
+    if ! sys_pacman -S --needed --noconfirm $newpkgs >>"$LOG" 2>&1; then
+        printf 'The installation failed, nothing was removed. See %s\n' "$LOG"
+        tail -n 3 "$LOG"
+        return 1
+    fi
+    for d in $olds; do
+        de_vars "$d"
+        olddm=$DE_DM
+        oldrm=$DE_RM
+        oldcfg=$DE_CFG
+        printf '==> Removing %s\n' "$d"
+        list=""
+        for item in $oldrm; do
+            case $item in
+                @*) list="$list $(pacman -Qgq "${item#@}" 2>/dev/null)" ;;
+                *) list="$list $item" ;;
+            esac
+        done
+        keep=""
+        for k in $newpkgs; do
+            keep="$keep $k"
+        done
+        final=""
+        for item in $list; do
+            case " $keep " in
+                *" $item "*) continue ;;
+            esac
+            if pacman -Qq "$item" >/dev/null 2>&1; then
+                final="$final $item"
+            fi
+        done
+        if [ -n "$final" ]; then
+            sys_run sh -c 'for pass in 1 2 3; do for p in "$@"; do /usr/bin/pacman -Rns --noconfirm "$p" >/dev/null 2>&1 || true; done; done' sh $final >>"$LOG" 2>&1 || true
+        fi
+        if [ "$olddm" != "$newdm" ]; then
+            systemctl disable "$olddm" >>"$LOG" 2>&1 || true
+            sys_pacman -Rns --noconfirm "$olddm" >>"$LOG" 2>&1 || true
+        fi
+        for h in /Users/*; do
+            if [ -d "$h" ]; then
+                ( cd "$h" && rm -rf $oldcfg )
+            fi
+        done
+    done
+    systemctl enable --force "$newdm" >>"$LOG" 2>&1 || true
+    refresh
+    printf '==> Done. Reboot to log into %s.\n' "$want"
+    return 0
+}
+change_int() {
+    want=${1:-}
+    case $want in
+        chimerautils|busybox) ;;
+        *)
+            printf 'Usage: pkg change-int <chimerautils|busybox>\n'
+            return 1 ;;
+    esac
+    sys_writable || return 1
+    cur=$(cat "$LIBDIR/userland/current" 2>/dev/null || true)
+    if [ -z "$cur" ]; then
+        if [ -L /System/bin/ls ] && [ "$(readlink /System/bin/ls)" = busybox ]; then
+            cur=busybox
+        elif [ -e /System/bin/bsdtar ]; then
+            cur=chimerautils
+        else
+            cur=gnu
+        fi
+    fi
+    if [ "$cur" = gnu ]; then
+        printf 'This system still uses the GNU utilities, there is nothing to switch.\n'
+        return 1
+    fi
+    if [ "$cur" = "$want" ]; then
+        printf 'Already using %s.\n' "$want"
+        return 0
+    fi
+    pl=$LIBDIR/userland/payload.tar.zst
+    if [ ! -f "$pl" ]; then
+        mkdir -p "$LIBDIR/userland"
+        printf '==> Downloading the utilities\n'
+        if curl -fsSL -o "$pl.part" "${FASDEQOS_PAYLOAD_URL:-https://raw.githubusercontent.com/Fasdeq13/fasdeqOS/main/fasdeqos-payload.tar.zst}"; then
+            mv "$pl.part" "$pl"
+        else
+            rm -f "$pl.part"
+            printf 'Could not download the utilities. Check the network and try again.\n'
+            return 1
+        fi
+    fi
+    stage=/System/.userland-stage
+    rm -rf "$stage"
+    mkdir -p "$stage"
+    if ! bsdtar -xpf "$pl" -C "$stage" --strip-components=2 --exclude ./usr/bin/pkg ./usr; then
+        rm -rf "$stage"
+        printf 'Could not unpack the utilities.\n'
+        return 1
+    fi
+    printf '==> Switching to %s\n' "$want"
+    if [ "$want" = busybox ]; then
+        if [ ! -x /System/bin/busybox ]; then
+            if ! run_sys -S --needed --noconfirm busybox; then
+                rm -rf "$stage"
+                return 1
+            fi
+        fi
+        applets=$(/System/bin/busybox --list)
+        for f in "$stage"/bin/*; do
+            n=$(basename "$f")
+            case $n in
+                pkg|pkg-real|getopt) continue ;;
+            esac
+            case " $(echo $applets) " in
+                *" $n "*)
+                    ln -sfn busybox "/System/bin/$n.new"
+                    mv -f "/System/bin/$n.new" "/System/bin/$n" ;;
+            esac
+        done
+    else
+        for f in "$stage"/bin/*; do
+            n=$(basename "$f")
+            case $n in
+                pkg|pkg-real|getopt) continue ;;
+            esac
+            if [ -L "/System/bin/$n" ] && [ "$(readlink "/System/bin/$n")" = busybox ]; then
+                rm -f "/System/bin/$n"
+            fi
+            cp -a "$f" "/System/bin/$n.new"
+            mv -f "/System/bin/$n.new" "/System/bin/$n"
+        done
+        if [ -d "$stage/lib" ]; then
+            cp -a "$stage/lib/." /System/lib/
+        fi
+        if [ -x /System/bin/bsdtar ] && [ ! -e /System/bin/tar ]; then
+            cp /System/bin/bsdtar /System/bin/tar
+        fi
+    fi
+    rm -rf "$stage"
+    mkdir -p "$LIBDIR/userland"
+    printf '%s\n' "$want" > "$LIBDIR/userland/current"
+    printf '==> Done. Open a new terminal to use %s.\n' "$want"
+    return 0
 }
 sys_writable() {
     if touch /System/.pkg-w 2>/dev/null; then
@@ -415,7 +789,7 @@ after_native() {
     done
     for p in "$@"; do
         name=$(bundle_name "$p")
-        if [ ! -d "$APPS/$name.pkg" ]; then
+        if [ ! -d "$APPS/$name.pkg" ] || [ -f "$APPS/$name.pkg/container" ]; then
             continue
         fi
         if grep -qx "$p" "$LIBDIR/compat.list" 2>/dev/null; then
@@ -425,7 +799,7 @@ after_native() {
     refresh
     for p in "$@"; do
         name=$(bundle_name "$p")
-        if [ ! -d "$APPS/$name.pkg" ]; then
+        if [ ! -d "$APPS/$name.pkg" ] || [ -f "$APPS/$name.pkg/container" ]; then
             continue
         fi
         if ! sh "$BIN/fasdeqos-libcheck" "$name" >>"$LOG" 2>&1; then
@@ -435,6 +809,7 @@ after_native() {
 }
 container_install() {
     p=$1
+    pfile=${2:-}
     name=$(bundle_name "$p")
     b=$APPS/$name.pkg
     c=fasdeqos-$p
@@ -449,21 +824,28 @@ container_install() {
         hook="$hook; printf '%s\\n' '$snip' >> /etc/pacman.conf"
     fi
     hook="$hook; pacman -Sy"
-    nv=""
-    if [ -e /proc/driver/nvidia/version ]; then
-        nv=--nvidia
-    fi
-    if ! as_user distrobox create --yes $nv --name "$c" --image docker.io/library/archlinux:latest --pre-init-hooks "$hook" --additional-packages "base-devel git" >>"$LOG" 2>&1; then
+    if ! as_user distrobox create --yes --name "$c" --image "$IMAGE" --pre-init-hooks "$hook" --additional-packages "base-devel git" >>"$LOG" 2>&1; then
         as_user distrobox rm --force "$c" >>"$LOG" 2>&1
         return 1
     fi
     tmp=$(mktemp -d /tmp/pkg-export.XXXXXX)
     chown "$user" "$tmp"
+    if [ -n "$pfile" ]; then
+        cp "$pfile" "$tmp/local.pkg"
+        chown "$user" "$tmp/local.pkg"
+    fi
     cat > "$tmp/install.sh" <<'INSTALLER'
 p=$1
+if [ -n "$2" ]; then
+    sudo pacman -U --noconfirm "$2" || exit 1
+    exit 0
+fi
 if pacman -Si "$p" >/dev/null 2>&1; then
     sudo pacman -S --noconfirm --needed "$p" || exit 1
     exit 0
+fi
+if ! command -v yay >/dev/null 2>&1; then
+    sudo pacman -S --noconfirm --needed yay >/dev/null 2>&1 || true
 fi
 if ! command -v yay >/dev/null 2>&1; then
     d=$(mktemp -d)
@@ -474,7 +856,7 @@ fi
 yay -S --noconfirm --needed "$p" || exit 1
 exit 0
 INSTALLER
-    if ! as_user distrobox enter --name "$c" -- sh "$tmp/install.sh" "$p" >>"$LOG" 2>&1; then
+    if ! as_user distrobox enter --name "$c" -- sh "$tmp/install.sh" "$p" "${pfile:+$tmp/local.pkg}" >>"$LOG" 2>&1; then
         as_user distrobox rm --force "$c" >>"$LOG" 2>&1
         rm -rf "$tmp"
         return 1
@@ -589,22 +971,78 @@ case $cmd in
         sync_repos
         printf 'Repository %s removed.\n' "$name"
         exit 0 ;;
+    change-desktop)
+        change_desktop "$@"
+        exit $? ;;
+    change-int)
+        change_int "$@"
+        exit $? ;;
     install)
         : > "$LOG"
         sync_repos
+        reconcile
         status=0
         native=""
         sysl=""
+        sysfiles=""
+        fresh=""
         for p in "$@"; do
             case $p in
                 -*) continue ;;
             esac
+            file=""
+            case $p in
+                *.pkg.tar|*.pkg.tar.*)
+                    case $p in
+                        /*) file=$p ;;
+                        *) file=$PWD/$p ;;
+                    esac
+                    if [ ! -f "$file" ]; then
+                        printf 'File not found: %s\n' "$p"
+                        status=1
+                        continue
+                    fi
+                    p=$(local_name "$file")
+                    if [ -z "$p" ]; then
+                        printf 'This is not a valid package file.\n'
+                        status=1
+                        continue
+                    fi ;;
+            esac
             if is_system "$p"; then
-                sysl="$sysl $p"
-            elif containers_ok && is_heavy "$p"; then
-                if ! container_install "$p"; then
+                if [ -n "$file" ]; then
+                    sysfiles="$sysfiles $file"
+                else
+                    sysl="$sysl $p"
+                fi
+            elif only_container "$p" && ! containers_ok; then
+                printf '%s runs only in a container. Install podman and distrobox and run pkg with sudo as a regular user.\n' "$p"
+                status=1
+            elif containers_ok && { is_heavy "$p" || only_container "$p"; }; then
+                if container_install "$p" "$file"; then
+                    fresh="$fresh $p"
+                elif only_container "$p"; then
+                    printf 'The container install of %s failed. See %s\n' "$p" "$LOG"
+                    tail -n 3 "$LOG"
+                    status=1
+                elif [ -n "$file" ]; then
+                    printf 'The container install failed, installing %s the regular way.\n' "$p"
+                    if native_file "$file" "$p"; then
+                        fresh="$fresh $p"
+                    else
+                        status=1
+                    fi
+                else
                     printf 'The container install failed, installing %s the regular way.\n' "$p"
                     native="$native $p"
+                fi
+            elif [ -n "$file" ]; then
+                if native_file "$file" "$p"; then
+                    fresh="$fresh $p"
+                else
+                    printf 'Could not install %s. See %s\n' "$p" "$LOG"
+                    tail -n 3 "$LOG"
+                    status=1
                 fi
             else
                 native="$native $p"
@@ -618,12 +1056,24 @@ case $cmd in
                 status=1
             fi
         fi
+        if [ -n "$sysfiles" ]; then
+            printf '==> Installing system packages from files\n'
+            run_sys -U --noconfirm $sysfiles || status=1
+        fi
         if [ -n "$native" ]; then
             run_real install $native || status=1
             after_native $native
+            fresh="$fresh $native"
         else
-            refresh
+            after_native $fresh
         fi
+        for p in $fresh; do
+            place_desktop "$APPS/$(bundle_name "$p").pkg"
+        done
+        refresh
+        for p in $fresh; do
+            export_user_launchers "$(bundle_name "$p")"
+        done
         exit $status ;;
     sys)
         sys_writable || exit 1
@@ -667,10 +1117,12 @@ case $cmd in
             fi
             rm -f "$RECEIPTS/$name.receipt"
         done
+        drop_user_launchers
         refresh
         exit $rc ;;
     upgrade)
         : > "$LOG"
+        reconcile
         names=""
         if [ $# -gt 0 ]; then
             for p in "$@"; do
@@ -709,9 +1161,16 @@ case $cmd in
         pacman -Si "$@" 2>/dev/null || pacman -Qi "$@" 2>/dev/null
         exit 0 ;;
     list)
-        for r in "$RECEIPTS"/*.receipt; do
-            if [ -f "$r" ]; then
-                basename "$r" .receipt
+        : > "$LOG"
+        reconcile
+        for b in "$APPS"/*.pkg; do
+            if [ ! -d "$b" ]; then
+                continue
+            fi
+            if [ -f "$b/container" ]; then
+                printf '%s (container)\n' "$(basename "$b" .pkg)"
+            else
+                basename "$b" .pkg
             fi
         done
         exit 0 ;;
@@ -745,7 +1204,7 @@ function __pkg_available
     command -q pacman; or return
     pacman -Sl 2>/dev/null | string replace -r '^(\S+) (\S+).*' '$2\t$1'
 end
-set -l __pkg_cmds install uninstall remove rm upgrade update cleanup search list info list-repo add-repo remove-repo compat check union sys kernel
+set -l __pkg_cmds install uninstall remove rm upgrade update cleanup search list info list-repo add-repo remove-repo compat check union sys kernel change-desktop change-int
 complete -c pkg -f
 complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a install -d "Install a package"
 complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a uninstall -d "Remove an installed package"
@@ -764,6 +1223,10 @@ complete -c pkg -n "__fish_seen_subcommand_from remove-repo" -a "(__pkg_repos)"
 complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a kernel -d "List or switch kernels"
 complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a sys -d "Run pacman on the system volume"
 complete -c pkg -n "__fish_seen_subcommand_from kernel" -a "list use sync"
+complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a change-desktop -d "Switch the desktop environment"
+complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a change-int -d "Switch chimerautils or busybox"
+complete -c pkg -n "__fish_seen_subcommand_from change-desktop" -a "plasma gnome cosmic hyprland niri xfce cinnamon mate lxqt"
+complete -c pkg -n "__fish_seen_subcommand_from change-int" -a "chimerautils busybox"
 FISHC
 }
 
@@ -1580,9 +2043,6 @@ install_userland() {
     if [ "$USERLAND" = busybox ]; then
         bsdtar -xpf "$PAYLOAD" -C "$sys" --strip-components=2 ./usr/bin/pkg
         install -m 755 /usr/bin/busybox "$sys/bin/busybox"
-        if [ -x /usr/bin/env ] && [ ! -L /usr/bin/env ]; then
-            install -m 755 /usr/bin/env "$sys/bin/env"
-        fi
         for a in $(/usr/bin/busybox --list); do
             if [ ! -e "$sys/bin/$a" ] && [ ! -L "$sys/bin/$a" ]; then
                 ln -s busybox "$sys/bin/$a"
@@ -1597,6 +2057,9 @@ install_userland() {
             cp "$sys/bin/bsdtar" "$sys/bin/tar"
         fi
     fi
+    mkdir -p "$TOP/Library/userland"
+    cp "$PAYLOAD" "$TOP/Library/userland/payload.tar.zst"
+    printf '%s\n' "${USERLAND:-chimerautils}" > "$TOP/Library/userland/current"
     mkdir -p "$sys/lib/fasdeqos"
     if [ -e "$sys/bin/pacman" ]; then
         mv "$sys/bin/pacman" "$sys/lib/fasdeqos/pacman"
