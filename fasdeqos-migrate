@@ -63,6 +63,7 @@ cleanup() {
         rm -f "$INITRAMFS"
     fi
 }
+
 trap cleanup EXIT
 
 in_list() {
