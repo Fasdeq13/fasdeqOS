@@ -31,6 +31,8 @@ SDB_ROOT=""
 TOOLS_TMP=""
 INITRAMFS=""
 KVER=""
+UPD=0
+UPDATE=0
 CMDLINE=""
 SNAPCMDLINE=""
 ESP=""
@@ -117,7 +119,12 @@ union_one() {
             count=$((count + 1))
         fi
     done
-    [ "$count" -gt 0 ] || return 0
+    if [ "$count" -eq 0 ]; then
+        if [ "$(findmnt -no FSTYPE "$target")" = overlay ]; then
+            mount --bind "$base" "$target"
+        fi
+        return 0
+    fi
     mount -t overlay overlay -o "$opts" "$target"
 }
 if [ "$mode" = boot ] && [ "$(findmnt -no FSTYPE /usr)" = overlay ]; then
@@ -339,6 +346,38 @@ place_desktop() {
     done
     return 0
 }
+is_system() {
+    case $1 in
+        linux|linux-*|*-headers|nvidia|nvidia-*|*-dkms|mesa|lib32-*|mkinitcpio|mkinitcpio-*|systemd|systemd-*|linux-firmware*|grub|limine|efibootmgr|base|base-devel|dracut|vulkan-*|xf86-video-*|btrfs-progs|glibc|pacman|filesystem) return 0 ;;
+    esac
+    return 1
+}
+sys_pacman() {
+    unshare -m sh -c 'mount --bind /System /usr || exit 97; if [ -d /System/opt ]; then mount --bind /System/opt /opt; fi; exec pacman "$@"' sh "$@"
+}
+sys_writable() {
+    if touch /System/.pkg-w 2>/dev/null; then
+        rm -f /System/.pkg-w
+        return 0
+    fi
+    printf 'The system volume is sealed. Run fasdeqos-unlock first, then try again.\n'
+    return 1
+}
+run_sys() {
+    sys_writable || return 1
+    if [ "$VERBOSE" -eq 1 ]; then
+        sys_pacman "$@"
+        return $?
+    fi
+    rcf=$(mktemp /tmp/pkg-rc.XXXXXX)
+    { sys_pacman "$@"; echo $? > "$rcf"; } >>"$LOG" 2>&1
+    rc=$(cat "$rcf")
+    rm -f "$rcf"
+    if [ "$rc" -ne 0 ]; then
+        printf 'Something went wrong. Run the command again with --verbose or see %s\n' "$LOG"
+    fi
+    return "$rc"
+}
 field() {
     sed -n "s/^$2=//p" "$1"
 }
@@ -546,11 +585,14 @@ case $cmd in
         sync_repos
         status=0
         native=""
+        sysl=""
         for p in "$@"; do
             case $p in
                 -*) continue ;;
             esac
-            if containers_ok && is_heavy "$p"; then
+            if is_system "$p"; then
+                sysl="$sysl $p"
+            elif containers_ok && is_heavy "$p"; then
                 if ! container_install "$p"; then
                     printf 'The container install failed, installing %s the regular way.\n' "$p"
                     native="$native $p"
@@ -559,6 +601,14 @@ case $cmd in
                 native="$native $p"
             fi
         done
+        if [ -n "$sysl" ]; then
+            printf '==> Installing system packages:%s\n' "$sysl"
+            if run_sys -S --needed --noconfirm $sysl; then
+                printf '==> Done. If you installed a kernel, it is ready for the next boot.\n'
+            else
+                status=1
+            fi
+        fi
         if [ -n "$native" ]; then
             run_real install $native || status=1
             after_native $native
@@ -566,6 +616,13 @@ case $cmd in
             refresh
         fi
         exit $status ;;
+    sys)
+        sys_writable || exit 1
+        sys_pacman "$@"
+        exit $? ;;
+    kernel)
+        sh "$BIN/fasdeqos-kernel" "$@"
+        exit $? ;;
     uninstall|remove|rm)
         : > "$LOG"
         for p in "$@"; do
@@ -577,8 +634,30 @@ case $cmd in
                 as_user distrobox rm --force "$(cat "$APPS/$name.pkg/container")" >>"$LOG" 2>&1 || true
             fi
         done
-        run_real uninstall "$@"
-        rc=$?
+        rc=0
+        rest=""
+        for p in "$@"; do
+            case $p in
+                -*) continue ;;
+            esac
+            name=$(bundle_name "$p")
+            if is_system "$p" && [ ! -d "$APPS/$name.pkg" ]; then
+                printf '==> Removing system package %s\n' "$p"
+                run_sys -Rns --noconfirm "$p" || rc=1
+            else
+                rest="$rest $p"
+            fi
+        done
+        if [ -n "$rest" ]; then
+            run_real uninstall $rest || rc=1
+        fi
+        for p in "$@"; do
+            name=$(bundle_name "$p")
+            if [ -d "$APPS/$name.pkg" ] && [ -f "$APPS/$name.pkg/container" ]; then
+                rm -rf "$APPS/$name.pkg"
+            fi
+            rm -f "$RECEIPTS/$name.receipt"
+        done
         refresh
         exit $rc ;;
     upgrade)
@@ -589,6 +668,8 @@ case $cmd in
                 names="$names $(bundle_name "$p")"
             done
         else
+            printf '==> Updating the system\n'
+            run_sys -Syu --noconfirm || true
             for r in "$RECEIPTS"/*.receipt; do
                 if [ -f "$r" ]; then
                     names="$names $(basename "$r" .receipt)"
@@ -654,7 +735,7 @@ end
 function __pkg_available
     pacman -Sl 2>/dev/null | string replace -r '^(\S+) (\S+).*' '$2\t$1'
 end
-set -l __pkg_cmds install uninstall remove rm upgrade update cleanup search list info list-repo add-repo remove-repo compat check union
+set -l __pkg_cmds install uninstall remove rm upgrade update cleanup search list info list-repo add-repo remove-repo compat check union sys kernel
 complete -c pkg -f
 complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a install -d "Install a package"
 complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a uninstall -d "Remove an installed package"
@@ -670,7 +751,224 @@ complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a cleanup -d "
 complete -c pkg -n "__fish_seen_subcommand_from install search info" -a "(__pkg_available)"
 complete -c pkg -n "__fish_seen_subcommand_from uninstall remove rm upgrade compat check" -a "(__pkg_installed)"
 complete -c pkg -n "__fish_seen_subcommand_from remove-repo" -a "(__pkg_repos)"
+complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a kernel -d "List or switch kernels"
+complete -c pkg -n "not __fish_seen_subcommand_from $__pkg_cmds" -a sys -d "Run pacman on the system volume"
+complete -c pkg -n "__fish_seen_subcommand_from kernel" -a "list use sync"
 FISHC
+}
+
+tool_kernel() {
+    cat <<'KERNEL'
+#!/usr/bin/env sh
+if [ "$(id -u)" -ne 0 ]; then
+    exec sudo "$0" "$@"
+fi
+LIB=${FASDEQOS_LIB:-/Library}
+MODS=${FASDEQOS_MODS:-/usr/lib/modules}
+LOGF=${FASDEQOS_KLOG:-/var/log/fasdeqos-kernel.log}
+CONF=$LIB/boot.conf
+if [ ! -f "$CONF" ]; then
+    printf 'The boot configuration is missing: %s\n' "$CONF" >&2
+    exit 0
+fi
+. "$CONF"
+if [ -d "$LIB/gnu-userland/bin" ]; then
+    PATH=$LIB/gnu-userland/bin:$PATH
+    export PATH
+fi
+list_kernels() {
+    for d in $(ls -1 "$MODS" 2>/dev/null | sort -V); do
+        if [ ! -f "$MODS/$d/vmlinuz" ]; then
+            continue
+        fi
+        pb=$(cat "$MODS/$d/pkgbase" 2>/dev/null || echo unknown)
+        printf '%s %s\n' "$pb" "$d"
+    done
+}
+ensure_mount() {
+    if ! grep -q " $1 " /proc/mounts; then
+        mkdir -p "$1"
+        mount "UUID=$2" "$1" || return 1
+    fi
+    return 0
+}
+install_to() {
+    d=$1/fasdeqos
+    mkdir -p "$d"
+    cp "$MODS/$best/vmlinuz" "$d/vmlinuz.new" || return 1
+    cp "$img" "$d/initramfs.img.new" || return 1
+    mv "$d/vmlinuz.new" "$d/vmlinuz"
+    mv "$d/initramfs.img.new" "$d/initramfs.img"
+    return 0
+}
+sync_kernel() {
+    list=$(mktemp /tmp/fasdeqos-klist.XXXXXX)
+    list_kernels > "$list"
+    pref=$(cat "$LIB/kernel.pkgbase" 2>/dev/null || true)
+    best=""
+    bestpb=""
+    while read -r pb d; do
+        if [ -z "$pref" ] || [ "$pb" = "$pref" ]; then
+            best=$d
+            bestpb=$pb
+        fi
+    done < "$list"
+    if [ -z "$best" ]; then
+        while read -r pb d; do
+            best=$d
+            bestpb=$pb
+        done < "$list"
+    fi
+    rm -f "$list"
+    if [ -z "$best" ]; then
+        printf 'No installed kernel was found, the boot files stay as they are.\n'
+        return 0
+    fi
+    printf '%s\n' "$bestpb" > "$LIB/kernel.pkgbase"
+    img=$(mktemp /tmp/fasdeqos-initramfs.XXXXXX)
+    if ! mkinitcpio -c "$LIB/mkinitcpio-fasdeqos.conf" -k "$best" -g "$img" > "$LOGF" 2>&1 || [ ! -s "$img" ]; then
+        rm -f "$img"
+        printf 'Could not build the initramfs for %s. The previous kernel stays in use. Log: %s\n' "$best" "$LOGF"
+        return 1
+    fi
+    if ! ensure_mount "$ESP_MOUNT" "$ESP_UUID"; then
+        rm -f "$img"
+        printf 'Could not mount the boot partition.\n'
+        return 1
+    fi
+    install_to "$ESP_MOUNT" || { rm -f "$img"; printf 'Could not write the boot files.\n'; return 1; }
+    if [ -n "${XBOOT_UUID:-}" ]; then
+        if ensure_mount /run/fasdeqos-xboot "$XBOOT_UUID"; then
+            install_to /run/fasdeqos-xboot || true
+            umount /run/fasdeqos-xboot 2>/dev/null || true
+        fi
+    fi
+    rm -f "$img"
+    sync
+    printf 'Kernel %s is ready for the next boot.\n' "$best"
+    return 0
+}
+cmd=${1:-sync}
+if [ $# -gt 0 ]; then
+    shift
+fi
+case $cmd in
+    list)
+        cur=$(cat "$LIB/kernel.pkgbase" 2>/dev/null || true)
+        list_kernels | while read -r pb d; do
+            mark=" "
+            if [ "$pb" = "$cur" ]; then
+                mark="*"
+            fi
+            printf '%s %s (%s)\n' "$mark" "$pb" "$d"
+        done
+        exit 0 ;;
+    use)
+        want=${1:-}
+        if ! list_kernels | grep -q "^$want "; then
+            printf 'That kernel is not installed. See: pkg kernel list\n'
+            exit 1
+        fi
+        printf '%s\n' "$want" > "$LIB/kernel.pkgbase"
+        sync_kernel
+        exit $? ;;
+    sync)
+        sync_kernel
+        exit $? ;;
+    *)
+        printf 'Usage: pkg kernel [list|use <name>|sync]\n'
+        exit 1 ;;
+esac
+KERNEL
+}
+
+tool_alpm_hook() {
+    cat <<'ALPM'
+[Trigger]
+Type = Path
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Target = usr/lib/modules/*/vmlinuz
+
+[Trigger]
+Type = Package
+Operation = Install
+Operation = Upgrade
+Target = mkinitcpio
+Target = btrfs-progs
+
+[Action]
+Description = Updating the FasdeqOS kernel and initramfs
+When = PostTransaction
+Exec = /usr/bin/sh -c '/usr/bin/sh /usr/bin/fasdeqos-kernel sync || true'
+ALPM
+}
+
+write_mkconf() {
+    mkdir -p "$TOP/Library"
+    cat > "$TOP/Library/mkinitcpio-fasdeqos.conf" <<'CONF'
+MODULES=(btrfs vfat dm_mod overlay)
+BINARIES=(btrfs)
+FILES=()
+HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
+CONF
+}
+
+write_boot_conf() {
+    local esp_uuid=$1 xboot=${2:-}
+    mkdir -p "$TOP/Library"
+    {
+        printf 'ESP_MOUNT=/System/Boot\n'
+        printf 'ESP_UUID=%s\n' "$esp_uuid"
+        if [ -n "$xboot" ]; then
+            printf 'XBOOT_UUID=%s\n' "$xboot"
+        fi
+    } > "$TOP/Library/boot.conf"
+}
+
+write_alpm() {
+    local priv=$TOP/private
+    if [ "$UPD" -eq 1 ]; then
+        priv=""
+    fi
+    mkdir -p "$TOP/System/share/libalpm/hooks" "$priv/etc/pacman.d/hooks"
+    tool_alpm_hook > "$TOP/System/share/libalpm/hooks/90-fasdeqos-kernel.hook"
+    ln -sf /dev/null "$priv/etc/pacman.d/hooks/90-mkinitcpio-install.hook"
+    ln -sf /dev/null "$priv/etc/pacman.d/hooks/60-mkinitcpio-remove.hook"
+}
+
+update_system() {
+    local relock=0 esp_dev esp_uuid
+    [ "$(id -u)" -eq 0 ] || die "Run this script as root."
+    say "FasdeqOS is already installed, updating its tools"
+    TOP=""
+    UPD=1
+    if ! touch /System/.fasdeqos-w 2>/dev/null; then
+        sh /System/bin/fasdeqos-unlock >/dev/null 2>&1 || true
+        relock=1
+    fi
+    touch /System/.fasdeqos-w 2>/dev/null || die "The system volume is sealed. Run fasdeqos-unlock and try again."
+    rm -f /System/.fasdeqos-w
+    write_initcpio
+    write_tools
+    write_alpm
+    write_mkconf
+    if [ ! -f /Library/boot.conf ]; then
+        esp_dev=$(findmnt -no SOURCE /System/Boot || true)
+        [ -n "$esp_dev" ] || die "The boot partition is not mounted at /System/Boot."
+        esp_uuid=$(blkid -s UUID -o value "$esp_dev")
+        write_boot_conf "$esp_uuid"
+    fi
+    if [ ! -s /Library/kernel.pkgbase ] && [ -f "/usr/lib/modules/$(uname -r)/pkgbase" ]; then
+        cp "/usr/lib/modules/$(uname -r)/pkgbase" /Library/kernel.pkgbase
+    fi
+    sh /System/bin/fasdeqos-kernel sync || say "The kernel files were not refreshed, see /var/log/fasdeqos-kernel.log"
+    sh /System/bin/fasdeqos-union >/dev/null 2>&1 || true
+    if [ "$relock" -eq 1 ]; then
+        sh /System/bin/fasdeqos-lock >/dev/null 2>&1 || true
+    fi
+    say "Update complete."
 }
 
 tool_hook() {
@@ -790,17 +1088,21 @@ OSREL
 
 write_tools() {
     local bin=$TOP/System/bin priv=$TOP/private p
+    if [ "$UPD" -eq 1 ]; then
+        priv=""
+    fi
     say "Installing FasdeqOS tools"
     if [ -e "$bin/pkg" ] && [ ! -e "$bin/pkg-real" ]; then
         mv "$bin/pkg" "$bin/pkg-real"
     fi
     tool_pkg > "$bin/pkg"
+    tool_kernel > "$bin/fasdeqos-kernel"
     tool_union > "$bin/fasdeqos-union"
     tool_compat > "$bin/fasdeqos-compat"
     tool_libcheck > "$bin/fasdeqos-libcheck"
     tool_lock > "$bin/fasdeqos-lock"
     tool_lock > "$bin/fasdeqos-unlock"
-    chmod +x "$bin/pkg" "$bin/pkg-real" "$bin/fasdeqos-union" "$bin/fasdeqos-compat" "$bin/fasdeqos-libcheck" "$bin/fasdeqos-lock" "$bin/fasdeqos-unlock"
+    chmod +x "$bin/pkg" "$bin/pkg-real" "$bin/fasdeqos-kernel" "$bin/fasdeqos-union" "$bin/fasdeqos-compat" "$bin/fasdeqos-libcheck" "$bin/fasdeqos-lock" "$bin/fasdeqos-unlock"
     mkdir -p "$TOP/System/share/fish/vendor_completions.d" "$priv/etc/udev/rules.d" "$priv/etc/modprobe.d"
     tool_fish > "$TOP/System/share/fish/vendor_completions.d/pkg.fish"
     printf 'KERNEL=="fd[0-9]*", ENV{UDISKS_IGNORE}="1"\n' > "$priv/etc/udev/rules.d/90-fasdeqos-nofloppy.rules"
@@ -1548,18 +1850,28 @@ ENTRY
 }
 
 install_boot() {
-    local l
+    local l xb xdev
     say "Creating the boot entries"
     write_initcpio
     pick_kernel
     INITRAMFS=$(mktemp /tmp/fasdeqos-initramfs.XXXXXX)
-    cat > /tmp/fasdeqos-mkinitcpio.conf <<'CONF'
-MODULES=(btrfs vfat dm_mod overlay)
-BINARIES=(btrfs)
-FILES=()
-HOOKS=(base udev modconf keyboard block btrfs fasdeqos-disk)
-CONF
-    mkinitcpio -c /tmp/fasdeqos-mkinitcpio.conf -k "$KVER" -g "$INITRAMFS"
+    write_mkconf
+    mkdir -p "$TOP/private/etc/initcpio/hooks" "$TOP/private/etc/initcpio/install"
+    cp -a /etc/initcpio/hooks/fasdeqos-disk "$TOP/private/etc/initcpio/hooks/"
+    cp -a /etc/initcpio/install/fasdeqos-disk "$TOP/private/etc/initcpio/install/"
+    write_alpm
+    xb=""
+    if [ -n "$SDB_ROOT" ] && [ "$SDB_ROOT" != "$ESP" ]; then
+        xdev=$(findmnt -no SOURCE "$SDB_ROOT" || true)
+        if [ -n "$xdev" ] && [ "$xdev" != "$ESP_DEV" ]; then
+            xb=$(blkid -s UUID -o value "$xdev" || true)
+        fi
+    fi
+    write_boot_conf "$ESP_UUID" "$xb"
+    if [ -f "/usr/lib/modules/$KVER/pkgbase" ]; then
+        cp "/usr/lib/modules/$KVER/pkgbase" "$TOP/Library/kernel.pkgbase"
+    fi
+    mkinitcpio -c "$TOP/Library/mkinitcpio-fasdeqos.conf" -k "$KVER" -g "$INITRAMFS"
     place_kernel "$ESP/fasdeqos"
     CMDLINE="root=UUID=$UUID fasdeqos_esp=$ESP_UUID rw init=/System/lib/systemd/systemd firmware_class.path=/usr/lib/firmware quiet"
     if [ "$SEAL" = sealed ]; then
@@ -1722,10 +2034,16 @@ while [ $# -gt 0 ]; do
             PAYLOAD_SRC=$2
             shift ;;
         --payload=*) PAYLOAD_SRC=${1#--payload=} ;;
+        --update) UPDATE=1 ;;
         *) die "Unknown option: $1" ;;
     esac
     shift
 done
+
+if [ "$UPDATE" -eq 1 ] || { [ -d /System ] && [ -d /Applications ] && grep -qx 'ID=fasdeqos' /etc/os-release 2>/dev/null; }; then
+    update_system
+    exit 0
+fi
 
 check_system
 resolve_payload
