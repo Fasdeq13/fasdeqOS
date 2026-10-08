@@ -1274,10 +1274,78 @@ if [ ! -f "$CONF" ]; then
     exit 0
 fi
 . "$CONF"
+shim=$(mktemp -d /tmp/fasdeqos-shim.XXXXXX)
+trap 'rm -rf "$shim"' EXIT
+cat > "$shim/realpath" <<'SHIM'
+#!/bin/sh
+nosym=0
+must=0
+while [ $# -gt 0 ]; do
+    case $1 in
+        --) shift; break ;;
+        -*)
+            case $1 in *s*) nosym=1 ;; esac
+            case $1 in *e*) must=1 ;; esac
+            shift ;;
+        *) break ;;
+    esac
+done
+rc=0
+for p in "$@"; do
+    case $p in
+        /*) a=$p ;;
+        *) a=$PWD/$p ;;
+    esac
+    if [ "$must" -eq 1 ] && [ ! -e "$a" ] && [ ! -L "$a" ]; then
+        rc=1
+        continue
+    fi
+    if [ "$nosym" -eq 0 ] && [ -L "$a" ]; then
+        t=$(readlink "$a")
+        case $t in
+            /*) a=$t ;;
+            *) a=$(dirname "$a")/$t ;;
+        esac
+        "$0" -- "$a" || rc=1
+        continue
+    fi
+    if [ "$a" = / ]; then
+        echo /
+        continue
+    fi
+    if [ -d "$a" ]; then
+        if [ "$nosym" -eq 1 ]; then
+            (cd "$a" && pwd -L)
+        else
+            (cd "$a" && pwd -P)
+        fi
+        continue
+    fi
+    d=$(dirname "$a")
+    b=$(basename "$a")
+    if [ -d "$d" ]; then
+        if [ "$nosym" -eq 1 ]; then
+            dd=$(cd "$d" && pwd -L)
+        else
+            dd=$(cd "$d" && pwd -P)
+        fi
+        if [ "$dd" = / ]; then
+            echo "/$b"
+        else
+            echo "$dd/$b"
+        fi
+    else
+        echo "$a"
+    fi
+done
+exit $rc
+SHIM
+chmod +x "$shim/realpath"
+PATH=$shim:$PATH
 if [ -d "$LIB/gnu-userland/bin" ]; then
     PATH=$LIB/gnu-userland/bin:$PATH
-    export PATH
 fi
+export PATH
 list_kernels() {
     for d in $(ls -1 "$MODS" 2>/dev/null | sort -V); do
         if [ ! -f "$MODS/$d/vmlinuz" ]; then
