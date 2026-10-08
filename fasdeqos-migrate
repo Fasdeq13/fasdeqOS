@@ -32,6 +32,7 @@ TOOLS_TMP=""
 INITRAMFS=""
 KVER=""
 UPD=0
+TOOLS_VERSION=2026.10.08-4
 UPDATE=0
 CMDLINE=""
 SNAPCMDLINE=""
@@ -1346,6 +1347,15 @@ if [ -d "$LIB/gnu-userland/bin" ]; then
     PATH=$LIB/gnu-userland/bin:$PATH
 fi
 export PATH
+build_initramfs() {
+    mkdir -p "$shim/up" "$shim/work"
+    cp "$shim/realpath" "$shim/up/realpath"
+    if command -v unshare >/dev/null 2>&1; then
+        unshare -m sh -c 'mount -t overlay overlay -o "lowerdir=/usr/bin,upperdir=$1/up,workdir=$1/work" /usr/bin 2>/dev/null || mount --bind "$1/realpath" /usr/bin/realpath 2>/dev/null; shift; exec "$@"' sh "$shim" mkinitcpio "$@"
+    else
+        mkinitcpio "$@"
+    fi
+}
 list_kernels() {
     for d in $(ls -1 "$MODS" 2>/dev/null | sort -V); do
         if [ ! -f "$MODS/$d/vmlinuz" ]; then
@@ -1396,7 +1406,7 @@ sync_kernel() {
     fi
     printf '%s\n' "$bestpb" > "$LIB/kernel.pkgbase"
     img=$(mktemp /tmp/fasdeqos-initramfs.XXXXXX)
-    if ! mkinitcpio -c "$LIB/mkinitcpio-fasdeqos.conf" -k "$best" -g "$img" > "$LOGF" 2>&1 || [ ! -s "$img" ]; then
+    if ! build_initramfs -c "$LIB/mkinitcpio-fasdeqos.conf" -k "$best" -g "$img" > "$LOGF" 2>&1 || [ ! -s "$img" ]; then
         rm -f "$img"
         printf 'Could not build the initramfs for %s. The previous kernel stays in use. Log: %s\n' "$best" "$LOGF"
         tail -n 6 "$LOGF" 2>/dev/null
@@ -1512,7 +1522,7 @@ write_alpm() {
 update_system() {
     local relock=0 esp_dev esp_uuid
     [ "$(id -u)" -eq 0 ] || die "Run this script as root."
-    say "FasdeqOS is already installed, updating its tools"
+    say "FasdeqOS is already installed, updating its tools (version $TOOLS_VERSION)"
     TOP=""
     UPD=1
     if ! touch /System/.fasdeqos-w 2>/dev/null; then
