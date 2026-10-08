@@ -11,7 +11,7 @@ TOP=/run/fasdeqos-top
 VOLUMES="root System Applications Library Users private"
 GNU_PKGS="coreutils grep sed findutils gawk diffutils gzip tar which"
 COMPAT_PKGS=${FASDEQOS_COMPAT:-"steam davinci-resolve davinci-resolve-studio"}
-HEAVY_PKGS=${FASDEQOS_HEAVY:-"steam blender davinci-resolve davinci-resolve-studio"}
+HEAVY_PKGS=${FASDEQOS_HEAVY:-"steam blender davinci-resolve davinci-resolve-studio gimp pinta krita inkscape kdenlive obs-studio libreoffice-fresh lutris heroic-games-launcher-bin bottles godot"}
 SNAPDIR=.fasdeqos-snapshots
 SNAPNAME=initial
 MODE=""
@@ -353,7 +353,7 @@ is_system() {
     return 1
 }
 sys_pacman() {
-    unshare -m sh -c 'mount --bind /System /usr || exit 97; if [ -d /System/opt ]; then mount --bind /System/opt /opt; fi; exec pacman "$@"' sh "$@"
+    unshare -m sh -c 'mount --bind /System /usr || exit 97; if [ -d /System/opt ]; then mount --bind /System/opt /opt; fi; exec /usr/bin/pacman "$@"' sh "$@"
 }
 sys_writable() {
     if touch /System/.pkg-w 2>/dev/null; then
@@ -375,6 +375,7 @@ run_sys() {
     rm -f "$rcf"
     if [ "$rc" -ne 0 ]; then
         printf 'Something went wrong. Run the command again with --verbose or see %s\n' "$LOG"
+        tail -n 3 "$LOG" 2>/dev/null
     fi
     return "$rc"
 }
@@ -395,6 +396,7 @@ run_real() {
     rm -f "$rcf"
     if [ "$rc" -ne 0 ]; then
         printf 'Something went wrong. Run the command again with --verbose or see %s\n' "$LOG"
+        tail -n 3 "$LOG" 2>/dev/null
     fi
     return "$rc"
 }
@@ -733,6 +735,7 @@ function __pkg_repos
     end
 end
 function __pkg_available
+    command -q pacman; or return
     pacman -Sl 2>/dev/null | string replace -r '^(\S+) (\S+).*' '$2\t$1'
 end
 set -l __pkg_cmds install uninstall remove rm upgrade update cleanup search list info list-repo add-repo remove-repo compat check union sys kernel
@@ -1107,13 +1110,12 @@ write_tools() {
     tool_fish > "$TOP/System/share/fish/vendor_completions.d/pkg.fish"
     printf 'KERNEL=="fd[0-9]*", ENV{UDISKS_IGNORE}="1"\n' > "$priv/etc/udev/rules.d/90-fasdeqos-nofloppy.rules"
     printf 'blacklist floppy\n' > "$priv/etc/modprobe.d/fasdeqos-nofloppy.conf"
-    : > "$TOP/Library/compat.list"
+    touch "$TOP/Library/compat.list" "$TOP/Library/heavy.list"
     for p in $COMPAT_PKGS; do
-        printf '%s\n' "$p" >> "$TOP/Library/compat.list"
+        grep -qx "$p" "$TOP/Library/compat.list" || printf '%s\n' "$p" >> "$TOP/Library/compat.list"
     done
-    : > "$TOP/Library/heavy.list"
     for p in $HEAVY_PKGS; do
-        printf '%s\n' "$p" >> "$TOP/Library/heavy.list"
+        grep -qx "$p" "$TOP/Library/heavy.list" || printf '%s\n' "$p" >> "$TOP/Library/heavy.list"
     done
     mkdir -p "$priv/etc/systemd/system/sysinit.target.wants"
     cat > "$priv/etc/systemd/system/fasdeqos-union.service" <<'UNIT'
