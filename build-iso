@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-5
+VERSION=2026.10.09-6
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
@@ -156,9 +156,16 @@ MASK
 CONF
     cat > "$ROOT/System/lib/fasdeqos/bin/fastfetch" <<'WRAP'
 #!/System/bin/busybox sh
+export LD_LIBRARY_PATH=/System/lib
 exec /System/bin/fastfetch -c /System/share/fasdeqos/fastfetch.jsonc "$@"
 WRAP
     chmod +x "$ROOT/System/lib/fasdeqos/bin/fastfetch"
+    if ls "$ROOT"/System/lib/libyyjson.so* >/dev/null 2>&1; then
+        say "yyjson is in place"
+    else
+        say "warning: libyyjson was not installed, fastfetch will not start"
+        find "$WORK/ff" -name 'libyyjson*' 2>/dev/null | head -n 3
+    fi
 }
 
 write_os_release() {
@@ -212,7 +219,8 @@ PROF
 write_init() {
     local d=$ROOT/System/lib/fasdeqos/bin
     mkdir -p "$d" "$ROOT/private/etc/dinit.d/boot.d"
-    printf 'type = internal\nwaits-for.d = boot.d\n' > "$ROOT/private/etc/dinit.d/boot"
+    mkdir -p "$ROOT/private/var/log"
+    printf 'type = internal\nwaits-for = homebrew-prefix\n' > "$ROOT/private/etc/dinit.d/boot"
     cat > "$ROOT/System/bin/fasdeqos-rc" <<'RC'
 #!/System/bin/busybox sh
 export PATH=/System/bin:/bin
@@ -228,7 +236,9 @@ RC
 export PATH=/System/lib/fasdeqos/bin:/System/bin:/bin
 export TERM=linux
 export TERMINFO=/System/share/terminfo
-exec busybox su -l fasdeqos
+export HOME=/Users/fasdeqos USER=fasdeqos LOGNAME=fasdeqos SHELL=/System/bin/sh
+cd "$HOME"
+exec busybox su -m -c 'exec /System/bin/sh -l' fasdeqos
 SES
     cat > "$d/ls" <<'LS'
 #!/System/bin/busybox sh
