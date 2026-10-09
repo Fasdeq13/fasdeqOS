@@ -1,13 +1,13 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-6
+VERSION=2026.10.09-9
 BASE=https://repo.chimera-linux.org/live/latest
 FLAVOR=bootstrap
 ROOT=./darwin/rootfs
 TARBALL=""
 MIRRORS="https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux https://mirror.rackspace.com/archlinux"
-GLIBC_PKGS="glibc gcc-libs bash readline ncurses"
+GLIBC_PKGS="glibc libgcc libstdc++ bash readline ncurses"
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -91,32 +91,45 @@ relayout() {
     printf 'bin\nsbin\nlib\nlib64\netc\nvar\ntmp\nroot\nmnt\nmedia\ndev\nproc\nsys\nrun\nprivate\n' > "$r/.hidden"
 }
 
+install_tree() {
+    local src=$1 r=$2
+    mkdir -p "$r/System/lib/glibc"
+    if [ -d "$src/usr/lib" ]; then
+        find "$src/usr/lib" -maxdepth 1 \( -type f -o -type l \) -name '*.so*' -exec cp -af {} "$r/System/lib/glibc/" \; -exec rm -f {} \;
+    fi
+    if [ -d "$src/usr" ]; then
+        cp -an "$src/usr/." "$r/System/"
+    fi
+    if [ -d "$src/etc" ]; then
+        cp -an "$src/etc/." "$r/private/etc/"
+    fi
+}
+
 add_glibc() {
-    local r=$1 m idx p f t=$WORK/glibc ok=0
+    local r=$1 m idx p f pat t=$WORK/glibc ok=0
     mkdir -p "$t"
     for m in $MIRRORS; do
         idx=$(curl -fsL -m 60 "$m/core/os/x86_64/" 2>/dev/null || true)
         [ -n "$idx" ] || continue
         ok=1
         for p in $GLIBC_PKGS; do
-            f=$(printf '%s\n' "$idx" | grep -o "href=\"$p-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
+            pat=$(printf '%s' "$p" | sed 's/+/\\(+\\|%2B\\)/g')
+            f=$(printf '%s\n' "$idx" | grep -o "href=\"$pat-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
             [ -n "$f" ] || die "$p was not found on $m"
             say "Downloading $f"
             curl -fsL -m 900 -o "$t/$f" "$m/core/os/x86_64/$f" || die "download of $f failed"
             rm -rf "$t/x"
             mkdir -p "$t/x"
             bsdtar -xpf "$t/$f" -C "$t/x" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
-            if [ -d "$t/x/usr" ]; then
-                cp -an "$t/x/usr/." "$r/System/"
-            fi
-            if [ -d "$t/x/etc" ]; then
-                cp -an "$t/x/etc/." "$r/private/etc/"
-            fi
+            install_tree "$t/x" "$r"
         done
         break
     done
     [ "$ok" -eq 1 ] || die "no Arch mirror is reachable"
-    [ -e "$r/System/lib/ld-linux-x86-64.so.2" ] || die "glibc loader is missing after install"
+    [ -e "$r/System/lib/glibc/ld-linux-x86-64.so.2" ] || die "glibc loader is missing after install"
+    cp -af "$r/System/lib/glibc/ld-linux-x86-64.so.2" "$r/System/lib/ld-linux-x86-64.so.2"
+    printf '/System/lib/glibc\n' > "$r/private/etc/ld.so.conf"
+    printf '2\n' > "$r/Library/.layout"
 }
 
 remap_dir() {

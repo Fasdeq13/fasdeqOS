@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-6
+VERSION=2026.10.09-9
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
@@ -9,8 +9,12 @@ LIVEUSER=fasdeqos
 PASSWORD=fasdeqos
 BUSYBOX_URL=https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
 MIRRORS="https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux https://mirror.rackspace.com/archlinux"
-KMODS="loop squashfs overlay isofs sr_mod cdrom sd_mod ahci libahci nvme usb_storage uas xhci_pci ehci_pci ohci_pci uhci_hcd virtio_blk virtio_pci virtio_scsi ata_piix ata_generic nls_utf8 nls_cp437"
+KMODS_BASE="loop squashfs overlay isofs sr_mod cdrom sd_mod ahci libahci nvme usb_storage uas xhci_pci ehci_pci ohci_pci uhci_hcd virtio_blk virtio_pci virtio_scsi ata_piix ata_generic nls_utf8 nls_cp437"
 REBUILD=0
+FIRMWARE=1
+NVIDIA=0
+FW_PKGS="linux-firmware-whence linux-firmware-amdgpu linux-firmware-atheros linux-firmware-broadcom linux-firmware-cirrus linux-firmware-intel linux-firmware-mediatek linux-firmware-nvidia linux-firmware-other linux-firmware-radeon linux-firmware-realtek"
+TOOL_PKGS="kmod xz zstd zlib-ng-compat openssl"
 
 say() { printf '==> %s\n' "$*"; }
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
@@ -20,8 +24,10 @@ while [ $# -gt 0 ]; do
         --root) ROOT=$2; shift ;;
         --out) OUT=$2; shift ;;
         --rebuild) REBUILD=1 ;;
+        --no-firmware) FIRMWARE=0 ;;
+        --nvidia) NVIDIA=1 ;;
         -h|--help)
-            printf 'usage: build-iso [--root DIR] [--out FILE.iso] [--rebuild]\n'
+            printf 'usage: build-iso [--root DIR] [--out FILE.iso] [--rebuild] [--no-firmware] [--nvidia]\n'
             exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -39,18 +45,19 @@ WORK=$(mktemp -d /tmp/fasdeqos-iso.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
 ensure_rootfs() {
-    if [ "$REBUILD" -eq 1 ] || [ ! -d "$ROOT/System" ]; then
+    if [ "$REBUILD" -eq 1 ] || [ ! -d "$ROOT/System" ] || [ ! -f "$ROOT/Library/.layout" ]; then
         say "Building the rootfs"
         sh "$HERE/build-rootfs" --root "$ROOT"
     fi
 }
 
 arch_pkg() {
-    local p=$1 repo=${2:-core} m idx f
+    local p=$1 repo=${2:-core} m idx f pat
+    pat=$(printf '%s' "$p" | sed 's/+/\\(+\\|%2B\\)/g')
     for m in $MIRRORS; do
         idx=$(curl -fsL -m 60 "$m/$repo/os/x86_64/" 2>/dev/null || true)
         [ -n "$idx" ] || continue
-        f=$(printf '%s\n' "$idx" | grep -o "href=\"$p-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
+        f=$(printf '%s\n' "$idx" | grep -o "href=\"$pat-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
         [ -n "$f" ] || continue
         curl -fsL -m 1800 -o "$WORK/$f" "$m/$repo/os/x86_64/$f" || continue
         printf '%s' "$WORK/$f"
@@ -73,6 +80,49 @@ add_kernel() {
     mkdir -p "$ROOT/System/lib/modules"
     cp -a "$WORK/k/usr/lib/modules/$KVER" "$ROOT/System/lib/modules/$KVER"
     cp "$WORK/k/usr/lib/modules/$KVER/vmlinuz" "$WORK/vmlinuz"
+}
+
+install_tree() {
+    local src=$1 r=$2
+    mkdir -p "$r/System/lib/glibc"
+    if [ -d "$src/usr/lib" ]; then
+        find "$src/usr/lib" -maxdepth 1 \( -type f -o -type l \) -name '*.so*' -exec cp -af {} "$r/System/lib/glibc/" \; -exec rm -f {} \;
+    fi
+    if [ -d "$src/usr" ]; then
+        cp -an "$src/usr/." "$r/System/"
+    fi
+    if [ -d "$src/etc" ]; then
+        cp -an "$src/etc/." "$r/private/etc/"
+    fi
+}
+
+add_arch_pkgs() {
+    local repo=$1 list=$2 p pkg
+    for p in $list; do
+        pkg=$(arch_pkg "$p" "$repo") || { say "warning: $p was not found, skipping"; continue; }
+        rm -rf "$WORK/ap"
+        mkdir -p "$WORK/ap"
+        bsdtar -xpf "$pkg" -C "$WORK/ap" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
+        install_tree "$WORK/ap" "$ROOT"
+    done
+}
+
+add_hw_support() {
+    say "Adding kmod and the tools it needs"
+    add_arch_pkgs core "$TOOL_PKGS"
+    if [ "$FIRMWARE" -eq 1 ]; then
+        say "Adding firmware for real hardware, this is large"
+        add_arch_pkgs core "$FW_PKGS"
+    fi
+    if [ "$NVIDIA" -eq 1 ]; then
+        say "Adding the NVIDIA open kernel modules"
+        pkg=$(arch_pkg nvidia-open extra) || die "nvidia-open could not be downloaded"
+        rm -rf "$WORK/nv"
+        mkdir -p "$WORK/nv"
+        bsdtar -xpf "$pkg" -C "$WORK/nv" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
+        cp -a "$WORK/nv/usr/lib/modules/." "$ROOT/System/lib/modules/"
+    fi
+    say "Indexing the kernel modules"
     depmod -b "$ROOT/System" "$KVER" || die "depmod failed"
 }
 
@@ -94,16 +144,18 @@ build_launchd() {
     ln -s fasd-launchd "$ROOT/System/bin/init"
 }
 
+add_gcc_libs() {
+    say "Refreshing the gcc runtime libraries"
+    add_arch_pkgs core "libgcc libstdc++"
+    [ -e "$ROOT/System/lib/glibc/libgcc_s.so.1" ] || die "libgcc_s.so.1 is missing after the copy"
+    [ -e "$ROOT/System/lib/glibc/libstdc++.so.6" ] || die "libstdc++.so.6 is missing after the copy"
+    printf '/System/lib/glibc\n' > "$ROOT/private/etc/ld.so.conf"
+}
+
 add_fastfetch() {
-    local p pkg d=$ROOT/System/share/fasdeqos
+    local d=$ROOT/System/share/fasdeqos
     say "Installing fastfetch"
-    for p in yyjson fastfetch; do
-        pkg=$(arch_pkg "$p" extra) || die "$p could not be downloaded"
-        rm -rf "$WORK/ff"
-        mkdir -p "$WORK/ff"
-        bsdtar -xpf "$pkg" -C "$WORK/ff" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
-        cp -an "$WORK/ff/usr/." "$ROOT/System/"
-    done
+    add_arch_pkgs extra "yyjson fastfetch"
     mkdir -p "$d" "$ROOT/System/lib/fasdeqos/bin"
     cat > "$WORK/logo.mask" <<'MASK'
 ...XXXXXXXXXXXXXX...
@@ -156,15 +208,14 @@ MASK
 CONF
     cat > "$ROOT/System/lib/fasdeqos/bin/fastfetch" <<'WRAP'
 #!/System/bin/busybox sh
-export LD_LIBRARY_PATH=/System/lib
+export LD_LIBRARY_PATH=/System/lib/glibc
 exec /System/bin/fastfetch -c /System/share/fasdeqos/fastfetch.jsonc "$@"
 WRAP
     chmod +x "$ROOT/System/lib/fasdeqos/bin/fastfetch"
-    if ls "$ROOT"/System/lib/libyyjson.so* >/dev/null 2>&1; then
+    if ls "$ROOT"/System/lib/glibc/libyyjson.so* >/dev/null 2>&1; then
         say "yyjson is in place"
     else
         say "warning: libyyjson was not installed, fastfetch will not start"
-        find "$WORK/ff" -name 'libyyjson*' 2>/dev/null | head -n 3
     fi
 }
 
@@ -192,11 +243,11 @@ write_users() {
         rm -f "$ROOT/private/etc/$f"
     done
     h=$(openssl passwd -6 "$PASSWORD")
-    printf 'root:x:0:0:root:/root:/System/bin/sh\n%s:x:1000:1000:%s:/Users/%s:/System/bin/sh\nnobody:x:65534:65534:nobody:/:/System/bin/false\n' "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/passwd"
+    printf 'root:x:0:0:root:/root:/System/bin/bash\n%s:x:1000:1000:%s:/Users/%s:/System/bin/bash\nnobody:x:65534:65534:nobody:/:/System/bin/false\n' "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/passwd"
     printf 'root:x:0:\nwheel:x:10:%s\nusers:x:100:\n%s:x:1000:\nnobody:x:65534:\n' "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/group"
     printf 'root:%s:19000:0:99999:7:::\n%s:%s:19000:0:99999:7:::\nnobody:!:19000:::::::\n' "$h" "$LIVEUSER" "$h" > "$ROOT/private/etc/shadow"
     chmod 600 "$ROOT/private/etc/shadow"
-    printf '/System/bin/sh\n' > "$ROOT/private/etc/shells"
+    printf '/System/bin/bash\n/System/bin/sh\n' > "$ROOT/private/etc/shells"
     mkdir -p "$ROOT/Users/$LIVEUSER"
     chown -R 1000:1000 "$ROOT/Users/$LIVEUSER"
     if [ -d "$ROOT/Library/Homebrew" ]; then
@@ -229,6 +280,8 @@ busybox mount -t devpts devpts /dev/pts
 busybox mount -t tmpfs tmpfs /dev/shm
 busybox hostname fasdeqos
 busybox ip link set lo up 2>/dev/null
+/System/bin/ldconfig 2>/dev/null
+busybox find /sys/devices -name modalias -type f 2>/dev/null | busybox xargs busybox cat 2>/dev/null | busybox xargs /System/bin/modprobe -a -b -q 2>/dev/null
 echo 'fasdeqOS live system'
 RC
     cat > "$ROOT/System/bin/fasdeqos-session" <<'SES'
@@ -236,9 +289,9 @@ RC
 export PATH=/System/lib/fasdeqos/bin:/System/bin:/bin
 export TERM=linux
 export TERMINFO=/System/share/terminfo
-export HOME=/Users/fasdeqos USER=fasdeqos LOGNAME=fasdeqos SHELL=/System/bin/sh
+export HOME=/Users/fasdeqos USER=fasdeqos LOGNAME=fasdeqos SHELL=/System/bin/bash
 cd "$HOME"
-exec busybox su -m -c 'exec /System/bin/sh -l' fasdeqos
+exec busybox su -m -c 'exec /System/bin/bash -l' fasdeqos
 SES
     cat > "$d/ls" <<'LS'
 #!/System/bin/busybox sh
@@ -303,7 +356,13 @@ LS
 }
 
 collect_modules() {
-    local m line f i=0 name
+    local m line f i=0 name kd=$ROOT/System/lib/modules/$KVER/kernel/drivers sub
+    KMODS=$KMODS_BASE
+    for sub in ata nvme scsi usb/host usb/storage mmc/host block virtio hv; do
+        if [ -d "$kd/$sub" ]; then
+            KMODS="$KMODS $(find "$kd/$sub" -name '*.ko*' | sed 's#.*/##; s#\.ko.*##' | tr '\n' ' ')"
+        fi
+    done
     : > "$WORK/modlist.raw"
     for m in $KMODS; do
         modprobe -d "$ROOT/System" -S "$KVER" --show-depends "$m" 2>/dev/null | sed -n 's/^insmod //p' | awk '{print $1}' >> "$WORK/modlist.raw" || true
@@ -410,8 +469,10 @@ CFG
 say "fasdeqos iso builder $VERSION"
 ensure_rootfs
 add_kernel
+add_hw_support
 add_busybox
 build_launchd
+add_gcc_libs
 add_fastfetch
 write_os_release
 write_users
