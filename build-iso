@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-9
+VERSION=2026.10.09-10
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
@@ -36,7 +36,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 miss=""
-for t in curl bsdtar zstd gzip openssl mksquashfs cc grub-mkrescue xorriso mformat modprobe depmod find; do
+for t in curl bsdtar zstd gzip openssl mksquashfs cc grub-mkrescue xorriso mformat modprobe depmod ldconfig mount find; do
     command -v "$t" >/dev/null 2>&1 || miss="$miss $t"
 done
 [ -z "$miss" ] || die "missing tools:$miss"
@@ -124,6 +124,21 @@ add_hw_support() {
     fi
     say "Indexing the kernel modules"
     depmod -b "$ROOT/System" "$KVER" || die "depmod failed"
+}
+
+build_ld_cache() {
+    local t=$WORK/ldroot
+    say "Building the glibc library cache"
+    mkdir -p "$t/System/lib/glibc" "$t/etc"
+    mount --bind "$ROOT/System/lib/glibc" "$t/System/lib/glibc" || die "bind mount for the library cache failed"
+    printf '/System/lib/glibc\n' > "$t/etc/ld.so.conf"
+    if ! ldconfig -r "$t"; then
+        umount "$t/System/lib/glibc" || true
+        die "ldconfig failed"
+    fi
+    umount "$t/System/lib/glibc" || die "umount failed"
+    cp "$t/etc/ld.so.cache" "$ROOT/private/etc/ld.so.cache"
+    printf '/System/lib/glibc\n' > "$ROOT/private/etc/ld.so.conf"
 }
 
 add_busybox() {
@@ -474,6 +489,7 @@ add_busybox
 build_launchd
 add_gcc_libs
 add_fastfetch
+build_ld_cache
 write_os_release
 write_users
 write_init
