@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-2
+VERSION=2026.10.09-5
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
@@ -30,7 +30,7 @@ done
 
 [ "$(id -u)" -eq 0 ] || die "run as root"
 miss=""
-for t in curl bsdtar zstd gzip openssl mksquashfs grub-mkrescue xorriso modprobe depmod find; do
+for t in curl bsdtar zstd gzip openssl mksquashfs cc grub-mkrescue xorriso mformat modprobe depmod find; do
     command -v "$t" >/dev/null 2>&1 || miss="$miss $t"
 done
 [ -z "$miss" ] || die "missing tools:$miss"
@@ -46,13 +46,13 @@ ensure_rootfs() {
 }
 
 arch_pkg() {
-    local p=$1 m idx f
+    local p=$1 repo=${2:-core} m idx f
     for m in $MIRRORS; do
-        idx=$(curl -fsL -m 60 "$m/core/os/x86_64/" 2>/dev/null || true)
+        idx=$(curl -fsL -m 60 "$m/$repo/os/x86_64/" 2>/dev/null || true)
         [ -n "$idx" ] || continue
         f=$(printf '%s\n' "$idx" | grep -o "href=\"$p-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
         [ -n "$f" ] || continue
-        curl -fsL -m 1800 -o "$WORK/$f" "$m/core/os/x86_64/$f" || continue
+        curl -fsL -m 1800 -o "$WORK/$f" "$m/$repo/os/x86_64/$f" || continue
         printf '%s' "$WORK/$f"
         return 0
     done
@@ -84,8 +84,81 @@ add_busybox() {
     if [ ! -e "$ROOT/System/bin/sh" ]; then
         ln -s busybox "$ROOT/System/bin/sh"
     fi
+}
+
+build_launchd() {
+    [ -f "$HERE/fasd-launchd.c" ] || die "fasd-launchd.c is missing next to this script"
+    say "Building fasd-launchd"
+    cc -static -O2 -o "$ROOT/System/bin/fasd-launchd" "$HERE/fasd-launchd.c" || die "fasd-launchd failed to build, install gcc and libc6-dev"
     rm -f "$ROOT/System/bin/init"
-    ln -s busybox "$ROOT/System/bin/init"
+    ln -s fasd-launchd "$ROOT/System/bin/init"
+}
+
+add_fastfetch() {
+    local p pkg d=$ROOT/System/share/fasdeqos
+    say "Installing fastfetch"
+    for p in yyjson fastfetch; do
+        pkg=$(arch_pkg "$p" extra) || die "$p could not be downloaded"
+        rm -rf "$WORK/ff"
+        mkdir -p "$WORK/ff"
+        bsdtar -xpf "$pkg" -C "$WORK/ff" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
+        cp -an "$WORK/ff/usr/." "$ROOT/System/"
+    done
+    mkdir -p "$d" "$ROOT/System/lib/fasdeqos/bin"
+    cat > "$WORK/logo.mask" <<'MASK'
+...XXXXXXXXXXXXXX...
+..XXXXXXXXXXXXXXXX..
+.XXXXXXXXXXXXXXXXXX.
+XXXXXXXXXXXXXXXXXXXX
+XXXXXXXXXXXXXXXXXXXX
+XXXXXXXX.......XXXXX
+XXXXXXXX.......XXXXX
+XXXXXXXX...XXXXXXXXX
+XXXXXX........XXXXXX
+XXXXXX........XXXXXX
+XXXXXXXX...XXXXXXXXX
+XXXXXXXX...XXXXXXXXX
+XXXXXXXX...XXXXXXXXX
+XXXXXXXX...XXXXXXXXX
+XXXXXXXX...XXXXXXXXX
+.XXXXXXXXXXXXXXXXXX.
+..XXXXXXXXXXXXXXXX..
+...XXXXXXXXXXXXXX...
+MASK
+    awk 'BEGIN { split("226 226 220 220 214 214 208 208 202 202 196 196 160 160 124 124 88 88", c, " ") }
+        { gsub(/X/, "\342\226\210\342\226\210"); gsub(/\./, "  "); printf "\033[38;5;%sm%s\033[0m\n", c[NR], $0 }' "$WORK/logo.mask" > "$d/logo.ansi"
+    cat > "$d/fastfetch.jsonc" <<'CONF'
+{
+    "logo": {
+        "type": "file-raw",
+        "source": "/System/share/fasdeqos/logo.ansi",
+        "padding": { "top": 1, "right": 3 }
+    },
+    "display": {
+        "separator": "  ",
+        "color": { "keys": "38;5;220", "title": "38;5;203" }
+    },
+    "modules": [
+        "title",
+        { "type": "separator", "string": "-" },
+        { "type": "os", "key": "OS" },
+        { "type": "kernel", "key": "Kernel" },
+        { "type": "uptime", "key": "Uptime" },
+        { "type": "shell", "key": "Shell" },
+        { "type": "cpu", "key": "CPU" },
+        { "type": "gpu", "key": "GPU" },
+        { "type": "memory", "key": "Memory" },
+        { "type": "disk", "key": "Disk" },
+        "break",
+        { "type": "colors", "symbol": "block", "paddingLeft": 2 }
+    ]
+}
+CONF
+    cat > "$ROOT/System/lib/fasdeqos/bin/fastfetch" <<'WRAP'
+#!/System/bin/busybox sh
+exec /System/bin/fastfetch -c /System/share/fasdeqos/fastfetch.jsonc "$@"
+WRAP
+    chmod +x "$ROOT/System/lib/fasdeqos/bin/fastfetch"
 }
 
 write_os_release() {
@@ -123,37 +196,100 @@ write_users() {
         chown -R 1000:1000 "$ROOT/Library/Homebrew"
     fi
     cat > "$ROOT/private/etc/profile" <<'PROF'
-export PATH=/System/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin
-export PS1='\u@\h \W % '
+export PATH=/System/lib/fasdeqos/bin:/System/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin
+export TERM=${TERM:-linux}
+export TERMINFO=/System/share/terminfo
+export PS1='\u@\h \w % '
+if [ -z "$FASD_SHOWN" ] && [ -t 1 ]; then
+    FASD_SHOWN=1
+    export FASD_SHOWN
+    fastfetch 2>/dev/null
+fi
 export HOME=${HOME:-/Users}
 PROF
 }
 
 write_init() {
-    cat > "$ROOT/private/etc/inittab" <<'TAB'
-::sysinit:/System/bin/fasdeqos-rc
-tty1::respawn:-/System/bin/fasdeqos-session
-tty2::respawn:-/System/bin/busybox su -l root
-::ctrlaltdel:/System/bin/busybox reboot
-::shutdown:/System/bin/busybox umount -a -r
-TAB
+    local d=$ROOT/System/lib/fasdeqos/bin
+    mkdir -p "$d" "$ROOT/private/etc/dinit.d/boot.d"
+    printf 'type = internal\nwaits-for.d = boot.d\n' > "$ROOT/private/etc/dinit.d/boot"
     cat > "$ROOT/System/bin/fasdeqos-rc" <<'RC'
 #!/System/bin/busybox sh
 export PATH=/System/bin:/bin
-busybox mount -t devpts devpts /dev/pts 2>/dev/null || { busybox mkdir -p /dev/pts; busybox mount -t devpts devpts /dev/pts; }
-busybox mkdir -p /dev/shm
+busybox mkdir -p /dev/pts /dev/shm /run/user
+busybox mount -t devpts devpts /dev/pts
 busybox mount -t tmpfs tmpfs /dev/shm
 busybox hostname fasdeqos
 busybox ip link set lo up 2>/dev/null
-busybox mkdir -p /run/user
 echo 'fasdeqOS live system'
 RC
     cat > "$ROOT/System/bin/fasdeqos-session" <<'SES'
 #!/System/bin/busybox sh
-export PATH=/System/bin:/bin
+export PATH=/System/lib/fasdeqos/bin:/System/bin:/bin
+export TERM=linux
+export TERMINFO=/System/share/terminfo
 exec busybox su -l fasdeqos
 SES
-    chmod +x "$ROOT/System/bin/fasdeqos-rc" "$ROOT/System/bin/fasdeqos-session"
+    cat > "$d/ls" <<'LS'
+#!/System/bin/busybox sh
+REAL=/System/bin/ls
+target=""
+count=0
+skip=0
+for a in "$@"; do
+    case $a in
+        --*) ;;
+        -*) case $a in *[aAdR]*) skip=1 ;; esac ;;
+        *) count=$((count + 1)); target=$a ;;
+    esac
+done
+if [ "$count" -gt 1 ]; then
+    skip=1
+fi
+if [ -z "$target" ]; then
+    target=.
+fi
+if [ "$skip" -eq 1 ] || [ ! -d "$target" ] || [ ! -f "$target/.hidden" ]; then
+    exec "$REAL" "$@"
+fi
+hidden=$(cat "$target/.hidden")
+n=$#
+i=0
+removed=0
+while [ "$i" -lt "$n" ]; do
+    a=$1
+    shift
+    if [ "$a" = "$target" ] && [ "$removed" -eq 0 ] && [ "$target" != . ]; then
+        removed=1
+    else
+        set -- "$@" "$a"
+    fi
+    i=$((i + 1))
+done
+cd "$target" || exit 1
+set -- "$@" --
+found=0
+for e in *; do
+    if [ ! -e "$e" ] && [ ! -L "$e" ]; then
+        continue
+    fi
+    h=0
+    for x in $hidden; do
+        if [ "$x" = "$e" ]; then
+            h=1
+        fi
+    done
+    if [ "$h" -eq 0 ]; then
+        set -- "$@" "$e"
+        found=1
+    fi
+done
+if [ "$found" -eq 0 ]; then
+    exit 0
+fi
+exec "$REAL" -d "$@"
+LS
+    chmod +x "$ROOT/System/bin/fasdeqos-rc" "$ROOT/System/bin/fasdeqos-session" "$d/ls"
 }
 
 collect_modules() {
@@ -244,15 +380,15 @@ make_iso() {
 set default=0
 set timeout=5
 menuentry "fasdeqOS Live" {
-    linux /boot/vmlinuz init=/System/bin/init rw quiet console=tty0
+    linux /boot/vmlinuz init=/System/bin/fasd-launchd rw quiet console=tty0
     initrd /boot/initramfs.img
 }
 menuentry "fasdeqOS Live (safe graphics)" {
-    linux /boot/vmlinuz init=/System/bin/init rw nomodeset console=tty0
+    linux /boot/vmlinuz init=/System/bin/fasd-launchd rw nomodeset console=tty0
     initrd /boot/initramfs.img
 }
 menuentry "fasdeqOS Live (verbose)" {
-    linux /boot/vmlinuz init=/System/bin/init rw console=tty0
+    linux /boot/vmlinuz init=/System/bin/fasd-launchd rw console=tty0
     initrd /boot/initramfs.img
 }
 CFG
@@ -265,6 +401,8 @@ say "fasdeqos iso builder $VERSION"
 ensure_rootfs
 add_kernel
 add_busybox
+build_launchd
+add_fastfetch
 write_os_release
 write_users
 write_init
