@@ -1,0 +1,231 @@
+#!/bin/sh
+set -eu
+
+VERSION=2026.10.09-6
+BASE=https://repo.chimera-linux.org/live/latest
+FLAVOR=bootstrap
+ROOT=./darwin/rootfs
+TARBALL=""
+MIRRORS="https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux https://mirror.rackspace.com/archlinux"
+GLIBC_PKGS="glibc gcc-libs bash readline ncurses"
+
+say() { printf '==> %s\n' "$*"; }
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --root) ROOT=$2; shift ;;
+        --tarball) TARBALL=$2; shift ;;
+        --flavor) FLAVOR=$2; shift ;;
+        -h|--help)
+            printf 'usage: build-rootfs [--root DIR] [--tarball FILE|URL] [--flavor bootstrap|core|full]\n'
+            exit 0 ;;
+        *) die "unknown option: $1" ;;
+    esac
+    shift
+done
+
+[ "$(id -u)" -eq 0 ] || die "run as root, the rootfs keeps file owners"
+for t in curl bsdtar find; do
+    command -v "$t" >/dev/null 2>&1 || die "$t is required"
+done
+
+WORK=$(mktemp -d /tmp/fasdeqos-darwin.XXXXXX)
+trap 'rm -rf "$WORK"' EXIT
+
+fetch_base() {
+    local name url
+    if [ -n "$TARBALL" ]; then
+        case $TARBALL in
+            http://*|https://*) curl -fL -o "$WORK/base.tar.gz" "$TARBALL" ;;
+            *) cp "$TARBALL" "$WORK/base.tar.gz" ;;
+        esac
+        return 0
+    fi
+    say "Looking for the latest Chimera Linux $FLAVOR rootfs"
+    name=$(curl -fsL -m 60 "$BASE/" | grep -o "chimera-linux-x86_64-ROOTFS-[0-9]*-$FLAVOR.tar.gz" | sort -u | tail -n 1)
+    [ -n "$name" ] || die "the rootfs archive was not found at $BASE"
+    url=$BASE/$name
+    say "Downloading $name"
+    curl -fL -o "$WORK/base.tar.gz" "$url"
+}
+
+relayout() {
+    local src=$1 r=$2 d
+    mkdir -p "$r"
+    mkdir -p "$r/System" "$r/Library/Apps" "$r/Applications" "$r/Users/Shared" "$r/Volumes"
+    mkdir -p "$r/private/var"
+    for d in Preferences "Application Support" LaunchDaemons LaunchAgents Logs Caches Frameworks Fonts; do
+        mkdir -p "$r/Library/$d"
+    done
+    cp -a "$src/usr/." "$r/System/"
+    rm -rf "$src/usr"
+    if [ -d "$src/etc" ]; then
+        cp -a "$src/etc" "$r/private/etc"
+        rm -rf "$src/etc"
+    fi
+    for d in var root opt srv; do
+        if [ -d "$src/$d" ] && [ ! -L "$src/$d" ]; then
+            case $d in
+                var) cp -a "$src/var/." "$r/private/var/" ;;
+                root) cp -a "$src/root" "$r/private/var/root" ;;
+                opt) cp -a "$src/opt" "$r/System/opt" ;;
+                srv) ;;
+            esac
+        fi
+    done
+    mkdir -p "$r/private/var/root" "$r/private/var/tmp" "$r/private/tmp" "$r/private/etc"
+    chmod 700 "$r/private/var/root"
+    chmod 1777 "$r/private/tmp" "$r/private/var/tmp"
+    mkdir -p "$r/dev" "$r/proc" "$r/sys" "$r/run"
+    ln -sfn private/etc "$r/etc"
+    ln -sfn private/var "$r/var"
+    ln -sfn private/tmp "$r/tmp"
+    ln -sfn private/var/root "$r/root"
+    ln -sfn System/bin "$r/bin"
+    ln -sfn System/bin "$r/sbin"
+    ln -sfn System/lib "$r/lib"
+    ln -sfn System/lib "$r/lib64"
+    ln -sfn Volumes "$r/mnt"
+    ln -sfn Volumes "$r/media"
+    printf 'bin\nsbin\nlib\nlib64\netc\nvar\ntmp\nroot\nmnt\nmedia\ndev\nproc\nsys\nrun\nprivate\n' > "$r/.hidden"
+}
+
+add_glibc() {
+    local r=$1 m idx p f t=$WORK/glibc ok=0
+    mkdir -p "$t"
+    for m in $MIRRORS; do
+        idx=$(curl -fsL -m 60 "$m/core/os/x86_64/" 2>/dev/null || true)
+        [ -n "$idx" ] || continue
+        ok=1
+        for p in $GLIBC_PKGS; do
+            f=$(printf '%s\n' "$idx" | grep -o "href=\"$p-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
+            [ -n "$f" ] || die "$p was not found on $m"
+            say "Downloading $f"
+            curl -fsL -m 900 -o "$t/$f" "$m/core/os/x86_64/$f" || die "download of $f failed"
+            rm -rf "$t/x"
+            mkdir -p "$t/x"
+            bsdtar -xpf "$t/$f" -C "$t/x" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
+            if [ -d "$t/x/usr" ]; then
+                cp -an "$t/x/usr/." "$r/System/"
+            fi
+            if [ -d "$t/x/etc" ]; then
+                cp -an "$t/x/etc/." "$r/private/etc/"
+            fi
+        done
+        break
+    done
+    [ "$ok" -eq 1 ] || die "no Arch mirror is reachable"
+    [ -e "$r/System/lib/ld-linux-x86-64.so.2" ] || die "glibc loader is missing after install"
+}
+
+remap_dir() {
+    local dir=$2 pre=$3 l t rel orig depth rest ups abs n
+    find "$dir" -type l 2>/dev/null | while IFS= read -r l; do
+        t=$(readlink "$l")
+        rel=${l#"$dir"/}
+        orig=$pre/$rel
+        depth=$(printf '%s\n' "${orig%/*}" | awk -F/ '{print NF}')
+        case $t in
+            /*) abs=$t ;;
+            *)
+                rest=$t
+                ups=0
+                while :; do
+                    case $rest in
+                        ../*) rest=${rest#../}; ups=$((ups + 1)) ;;
+                        *) break ;;
+                    esac
+                done
+                if [ "$ups" -eq "$depth" ]; then
+                    abs=/$rest
+                else
+                    continue
+                fi ;;
+        esac
+        case $abs in
+            /usr/*) n=/System/${abs#/usr/} ;;
+            /usr) n=/System ;;
+            /etc/*) n=/private$abs ;;
+            /var/*) n=/private$abs ;;
+            *) continue ;;
+        esac
+        ln -sfn "$n" "$l"
+    done
+}
+
+fix_links() {
+    local r=$1
+    remap_dir "$r" "$r/System" usr
+    remap_dir "$r" "$r/private/etc" etc
+    remap_dir "$r" "$r/private/var" var
+}
+
+write_config() {
+    local r=$1
+    cat > "$r/System/lib/os-release" <<'OSREL'
+NAME="fasdeqOS"
+PRETTY_NAME="fasdeqOS"
+ID=fasdeqos
+ID_LIKE=fasdeq
+BUILD_ID=rolling
+ANSI_COLOR="38;2;23;147;209"
+HOME_URL="https://fasdeq13.github.io/fasdeq-os/"
+DOCUMENTATION_URL="https://fasdeq13.github.io/fasdeq-os/#overview"
+SUPPORT_URL="https://fasdeq13.github.io/fasdeq-os/"
+BUG_REPORT_URL="https://github.com/Fasdeq13/fasdeqOS/pulls"
+LOGO=fasdeqos-logo
+OSREL
+    rm -f "$r/private/etc/os-release"
+    ln -s ../System/lib/os-release "$r/private/etc/os-release"
+    printf 'fasdeqos\n' > "$r/private/etc/hostname"
+    : > "$r/private/etc/machine-id"
+    if [ -x "$r/System/bin/fish" ]; then
+        printf '/System/bin/fish\n' > "$r/private/etc/shells"
+    fi
+    printf 'set -g fish_greeting\n' > "$r/private/etc/fish.config"
+    if [ ! -e "$r/System/bin/init" ] && [ -x "$r/System/bin/dinit" ]; then
+        ln -s dinit "$r/System/bin/init"
+    fi
+}
+
+install_brew() {
+    local r=$1
+    command -v git >/dev/null 2>&1 || die "git is required to fetch Homebrew"
+    say "Installing Homebrew"
+    mkdir -p "$r/Library/Homebrew/bin" "$r/home/linuxbrew/.linuxbrew"
+    git clone --depth 1 https://github.com/Homebrew/brew "$r/Library/Homebrew/Homebrew" || die "Homebrew download failed"
+    ln -sfn ../Homebrew/bin/brew "$r/Library/Homebrew/bin/brew"
+    mkdir -p "$r/private/etc/dinit.d/boot.d"
+    cat > "$r/private/etc/dinit.d/homebrew-prefix" <<'SVC'
+type = scripted
+command = /System/bin/mount --bind /Library/Homebrew /home/linuxbrew/.linuxbrew
+stop-command = /System/bin/umount /home/linuxbrew/.linuxbrew
+depends-on = local.target
+SVC
+    ln -sfn ../homebrew-prefix "$r/private/etc/dinit.d/boot.d/homebrew-prefix"
+    mkdir -p "$r/System/share/fish/vendor_conf.d"
+    printf 'if test -x /home/linuxbrew/.linuxbrew/bin/brew\n    /home/linuxbrew/.linuxbrew/bin/brew shellenv fish | source\nend\n' > "$r/System/share/fish/vendor_conf.d/brew.fish"
+    printf '#!/bin/sh\nif [ -x /home/linuxbrew/.linuxbrew/bin/brew ]; then\n    PATH=/home/linuxbrew/.linuxbrew/bin:$PATH\n    export PATH\nfi\n' > "$r/private/etc/profile.d-brew.sh"
+    if ! grep -qx home "$r/.hidden"; then
+        printf 'home\n' >> "$r/.hidden"
+    fi
+}
+
+say "fasdeqos darwin rootfs builder $VERSION"
+fetch_base
+mkdir -p "$WORK/base"
+say "Unpacking"
+bsdtar -xpf "$WORK/base.tar.gz" -C "$WORK/base"
+[ -d "$WORK/base/usr" ] || die "the archive has no /usr, it is not a usr-merged rootfs"
+rm -rf "$ROOT"
+say "Laying out System, Library, Applications, Users, Volumes, private"
+relayout "$WORK/base" "$ROOT"
+say "Adding glibc from Arch next to musl from Chimera"
+add_glibc "$ROOT"
+fix_links "$ROOT"
+write_config "$ROOT"
+install_brew "$ROOT"
+say "The rootfs is ready: $ROOT"
+say "There is no /usr. musl comes from Chimera, glibc from Arch, both through the hidden /lib and /lib64 links."
+say "Homebrew is in /Library/Homebrew. After creating a user run: chown -R <user> /Library/Homebrew"
