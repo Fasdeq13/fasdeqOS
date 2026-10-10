@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-10
+VERSION=2026.10.10-11
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
@@ -12,7 +12,11 @@ MIRRORS="https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux ht
 KMODS_BASE="loop squashfs overlay isofs sr_mod cdrom sd_mod ahci libahci nvme usb_storage uas xhci_pci ehci_pci ohci_pci uhci_hcd virtio_blk virtio_pci virtio_scsi ata_piix ata_generic nls_utf8 nls_cp437"
 REBUILD=0
 FIRMWARE=1
-NVIDIA=0
+NVIDIA=1
+GPU=1
+BROADCOM=1
+STACK_PKGS="distrobox podman crun conmon netavark aardvark-dns fuse-overlayfs slirp4netns shadow flatpak bubblewrap xdg-dbus-proxy curl libarchive git"
+GPU_PKGS="mesa vulkan-icd-loader vulkan-radeon vulkan-intel libdrm nvidia-utils"
 FW_PKGS="linux-firmware-whence linux-firmware-amdgpu linux-firmware-atheros linux-firmware-broadcom linux-firmware-cirrus linux-firmware-intel linux-firmware-mediatek linux-firmware-nvidia linux-firmware-other linux-firmware-radeon linux-firmware-realtek"
 TOOL_PKGS="kmod xz zstd zlib-ng-compat openssl"
 
@@ -25,9 +29,11 @@ while [ $# -gt 0 ]; do
         --out) OUT=$2; shift ;;
         --rebuild) REBUILD=1 ;;
         --no-firmware) FIRMWARE=0 ;;
-        --nvidia) NVIDIA=1 ;;
+        --no-nvidia) NVIDIA=0 ;;
+        --no-gpu-userspace) GPU=0 ;;
+        --lean) FIRMWARE=0; NVIDIA=0; GPU=0; BROADCOM=0 ;;
         -h|--help)
-            printf 'usage: build-iso [--root DIR] [--out FILE.iso] [--rebuild] [--no-firmware] [--nvidia]\n'
+            printf 'usage: build-iso [--root DIR] [--out FILE.iso] [--rebuild] [--lean] [--no-firmware] [--no-nvidia] [--no-gpu-userspace]\n'
             exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -107,6 +113,19 @@ add_arch_pkgs() {
     done
 }
 
+add_kmod_pkg() {
+    local name=$1 pkg
+    pkg=$(arch_pkg "$name" extra) || { say "warning: $name could not be downloaded, skipping"; return 0; }
+    rm -rf "$WORK/km"
+    mkdir -p "$WORK/km"
+    bsdtar -xpf "$pkg" -C "$WORK/km" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
+    if [ ! -d "$WORK/km/usr/lib/modules/$KVER" ]; then
+        say "warning: $name is built for $(ls "$WORK/km/usr/lib/modules" 2>/dev/null | head -n 1), not for $KVER, skipping"
+        return 0
+    fi
+    cp -a "$WORK/km/usr/lib/modules/." "$ROOT/System/lib/modules/"
+}
+
 add_hw_support() {
     say "Adding kmod and the tools it needs"
     add_arch_pkgs core "$TOOL_PKGS"
@@ -116,14 +135,78 @@ add_hw_support() {
     fi
     if [ "$NVIDIA" -eq 1 ]; then
         say "Adding the NVIDIA open kernel modules"
-        pkg=$(arch_pkg nvidia-open extra) || die "nvidia-open could not be downloaded"
-        rm -rf "$WORK/nv"
-        mkdir -p "$WORK/nv"
-        bsdtar -xpf "$pkg" -C "$WORK/nv" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL
-        cp -a "$WORK/nv/usr/lib/modules/." "$ROOT/System/lib/modules/"
+        add_kmod_pkg nvidia-open
+    fi
+    if [ "$BROADCOM" -eq 1 ]; then
+        say "Adding the Broadcom wireless module"
+        add_kmod_pkg broadcom-wl
     fi
     say "Indexing the kernel modules"
     depmod -b "$ROOT/System" "$KVER" || die "depmod failed"
+}
+
+add_glibc_ldconfig() {
+    local pkg
+    pkg=$(arch_pkg glibc core) || die "glibc could not be downloaded for ldconfig"
+    rm -rf "$WORK/gl"
+    mkdir -p "$WORK/gl"
+    bsdtar -xpf "$pkg" -C "$WORK/gl" usr/bin/ldconfig
+    mkdir -p "$ROOT/System/lib/fasdeqos/bin"
+    cp "$WORK/gl/usr/bin/ldconfig" "$ROOT/System/lib/fasdeqos/bin/ldconfig"
+    chmod 755 "$ROOT/System/lib/fasdeqos/bin/ldconfig"
+}
+
+arch_stack() {
+    local list=$1
+    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --root "$ROOT" $list || die "arch-fetch failed for: $list"
+}
+
+add_pkg_stack() {
+    say "Installing distrobox, podman, flatpak and their dependencies"
+    mkdir -p "$ROOT/private/var/lib" "$HERE/cache/arch-fetch"
+    arch_stack "$STACK_PKGS"
+    for f in newuidmap newgidmap; do
+        [ -e "$ROOT/System/bin/$f" ] && chmod 4755 "$ROOT/System/bin/$f"
+    done
+    for f in distrobox podman flatpak curl; do
+        [ -e "$ROOT/System/bin/$f" ] || say "warning: $f is missing after the install"
+    done
+    if [ "$GPU" -eq 1 ]; then
+        say "Installing the Mesa and NVIDIA userspace, this is large"
+        arch_stack "$GPU_PKGS"
+    fi
+    mkdir -p "$ROOT/private/etc/ssl/certs"
+    rm -f "$ROOT/private/etc/ssl/certs/ca-certificates.crt" "$ROOT/private/etc/ssl/cert.pem"
+    if [ -f /etc/ssl/certs/ca-certificates.crt ]; then
+        cp /etc/ssl/certs/ca-certificates.crt "$ROOT/private/etc/ssl/certs/ca-certificates.crt"
+        cp /etc/ssl/certs/ca-certificates.crt "$ROOT/private/etc/ssl/cert.pem"
+    else
+        say "warning: the host has no CA bundle, HTTPS inside the image will fail"
+    fi
+    cp "$HERE/arch-fetch" "$ROOT/System/bin/arch-fetch"
+    chmod 755 "$ROOT/System/bin/arch-fetch"
+}
+
+build_pkg() {
+    [ -f "$HERE/pkg.c" ] || die "pkg.c is missing next to this script"
+    say "Building pkg"
+    cc -static -O2 -o "$ROOT/System/bin/pkg" "$HERE/pkg.c" || die "pkg failed to build"
+    mkdir -p "$ROOT/System/share/fish/vendor_completions.d" "$ROOT/System/share/applications" "$ROOT/Applications" "$ROOT/Library/pkg/db"
+    "$ROOT/System/bin/pkg" completions > "$ROOT/System/share/fish/vendor_completions.d/pkg.fish"
+}
+
+write_containers_conf() {
+    local h=$ROOT/Users/$LIVEUSER
+    mkdir -p "$h/.config/containers"
+    cat > "$h/.config/containers/storage.conf" <<'STORE'
+[storage]
+driver = "overlay"
+[storage.options.overlay]
+mount_program = "/System/bin/fuse-overlayfs"
+STORE
+    printf '%s:100000:65536\n' "$LIVEUSER" > "$ROOT/private/etc/subuid"
+    printf '%s:100000:65536\n' "$LIVEUSER" > "$ROOT/private/etc/subgid"
+    chown -R 1000:1000 "$h"
 }
 
 build_ld_cache() {
@@ -268,11 +351,14 @@ write_users() {
     if [ -d "$ROOT/Library/Homebrew" ]; then
         chown -R 1000:1000 "$ROOT/Library/Homebrew"
     fi
+    chown -R 1000:1000 "$ROOT/Applications" "$ROOT/Library/pkg" "$ROOT/System/share/applications" 2>/dev/null || true
     cat > "$ROOT/private/etc/profile" <<'PROF'
 export PATH=/System/lib/fasdeqos/bin:/System/bin:/home/linuxbrew/.linuxbrew/bin:/home/linuxbrew/.linuxbrew/sbin
 export TERM=${TERM:-linux}
 export TERMINFO=/System/share/terminfo
 export PS1='\u@\h \w % '
+export XDG_DATA_DIRS=/System/share:/home/linuxbrew/.linuxbrew/share
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
 if [ -z "$FASD_SHOWN" ] && [ -t 1 ]; then
     FASD_SHOWN=1
     export FASD_SHOWN
@@ -286,7 +372,7 @@ write_init() {
     local d=$ROOT/System/lib/fasdeqos/bin
     mkdir -p "$d" "$ROOT/private/etc/dinit.d/boot.d"
     mkdir -p "$ROOT/private/var/log"
-    printf 'type = internal\nwaits-for = homebrew-prefix\n' > "$ROOT/private/etc/dinit.d/boot"
+    printf 'type = internal\nwaits-for = homebrew-prefix\nwaits-for.d = boot.d\n' > "$ROOT/private/etc/dinit.d/boot"
     cat > "$ROOT/System/bin/fasdeqos-rc" <<'RC'
 #!/System/bin/busybox sh
 export PATH=/System/bin:/bin
@@ -295,8 +381,17 @@ busybox mount -t devpts devpts /dev/pts
 busybox mount -t tmpfs tmpfs /dev/shm
 busybox hostname fasdeqos
 busybox ip link set lo up 2>/dev/null
-/System/bin/ldconfig 2>/dev/null
+/System/lib/fasdeqos/bin/ldconfig 2>/dev/null
+busybox mkdir -p /sys/fs/cgroup
+busybox mount -t cgroup2 none /sys/fs/cgroup 2>/dev/null
+busybox mount --make-rshared / 2>/dev/null
+busybox mkdir -p /run/user/1000
+busybox chown 1000:1000 /run/user/1000
+busybox chmod 700 /run/user/1000
 busybox find /sys/devices -name modalias -type f 2>/dev/null | busybox xargs busybox cat 2>/dev/null | busybox xargs /System/bin/modprobe -a -b -q 2>/dev/null
+for m in fuse tun overlay veth bridge br_netfilter nf_tables nft_masq nft_nat nft_chain_nat nf_nat xt_MASQUERADE xt_conntrack xt_addrtype nf_conntrack; do
+    /System/bin/modprobe -q "$m" 2>/dev/null
+done
 echo 'fasdeqOS live system'
 RC
     cat > "$ROOT/System/bin/fasdeqos-session" <<'SES'
@@ -305,6 +400,8 @@ export PATH=/System/lib/fasdeqos/bin:/System/bin:/bin
 export TERM=linux
 export TERMINFO=/System/share/terminfo
 export HOME=/Users/fasdeqos USER=fasdeqos LOGNAME=fasdeqos SHELL=/System/bin/bash
+export XDG_RUNTIME_DIR=/run/user/1000
+export XDG_DATA_DIRS=/System/share:/home/linuxbrew/.linuxbrew/share
 cd "$HOME"
 exec busybox su -m -c 'exec /System/bin/bash -l' fasdeqos
 SES
@@ -489,9 +586,13 @@ add_busybox
 build_launchd
 add_gcc_libs
 add_fastfetch
+add_glibc_ldconfig
+add_pkg_stack
+build_pkg
 build_ld_cache
 write_os_release
 write_users
+write_containers_conf
 write_init
 make_initramfs
 make_iso

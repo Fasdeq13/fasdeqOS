@@ -31,7 +31,7 @@ struct job {
 
 static char *dinit_argv[] = {"/System/bin/dinit", "--container", "--services-dir", "/private/etc/dinit.d", NULL};
 static char *tty1_argv[] = {"/System/bin/fasdeqos-session", NULL};
-static char *tty2_argv[] = {"/System/bin/busybox", "sh", "-c", "export HOME=/root USER=root LOGNAME=root; cd /root; exec /System/bin/sh -l", NULL};
+static char *tty2_argv[] = {"/System/bin/busybox", "sh", "-c", "export HOME=/root USER=root LOGNAME=root; cd /root; exec /System/bin/bash -l", NULL};
 
 static struct job jobs[MAX_JOBS] = {
     {"dinit", NULL, dinit_argv, 0, 0, 0, 0},

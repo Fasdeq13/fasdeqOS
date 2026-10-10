@@ -1,0 +1,189 @@
+#!/bin/sh
+set -eu
+
+VERSION=2026.10.09-1
+ROOT=${ARCH_FETCH_ROOT:-}
+MIRRORS=${ARCH_FETCH_MIRRORS:-"https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux https://mirror.rackspace.com/archlinux"}
+REPOS=${ARCH_FETCH_REPOS:-"core extra"}
+CACHE=${ARCH_FETCH_CACHE:-/private/var/cache/arch-fetch}
+IGNORE=${ARCH_FETCH_IGNORE:-"coreutils findutils grep sed gawk diffutils gzip tar which bash filesystem iana-etc tzdata licenses pacman archlinux-keyring ca-certificates glibc gcc-libs linux-api-headers systemd systemd-sysvcompat udev"}
+DBDIR=${ARCH_FETCH_DBDIR:-}
+QUIET=0
+
+say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
+die() { printf 'arch-fetch: %s\n' "$*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case $1 in
+        --root) ROOT=$2; shift ;;
+        --repos) REPOS=$2; shift ;;
+        --quiet|-q) QUIET=1 ;;
+        --ignore) IGNORE="$IGNORE $2"; shift ;;
+        --) shift; break ;;
+        -*) die "unknown option: $1" ;;
+        *) break ;;
+    esac
+    shift
+done
+[ $# -gt 0 ] || die "usage: arch-fetch [--root DIR] [--repos 'core extra'] package ..."
+
+for t in curl bsdtar awk sed sort grep; do
+    command -v "$t" >/dev/null 2>&1 || die "$t is required"
+done
+
+W=$(mktemp -d /tmp/arch-fetch.XXXXXX)
+trap 'rm -rf "$W"' EXIT
+mkdir -p "$W/db" "$W/x" "$CACHE" 2>/dev/null || mkdir -p "$W/db" "$W/x"
+[ -d "$CACHE" ] && [ -w "$CACHE" ] || CACHE=$W/cache
+mkdir -p "$CACHE"
+
+pick_mirror() {
+    local m
+    for m in $MIRRORS; do
+        if curl -fsI -m 30 "$m/core/os/x86_64/core.db" >/dev/null 2>&1; then
+            MIRROR=$m
+            return 0
+        fi
+    done
+    die "no Arch mirror is reachable"
+}
+
+load_db() {
+    local r
+    if [ -n "$DBDIR" ]; then
+        cp -a "$DBDIR/." "$W/db/"
+    else
+        pick_mirror
+        for r in $REPOS; do
+            mkdir -p "$W/db/$r"
+            curl -fsL -m 300 -o "$W/$r.db" "$MIRROR/$r/os/x86_64/$r.db" || die "could not fetch the $r database"
+            bsdtar -xf "$W/$r.db" -C "$W/db/$r"
+        done
+    fi
+    : > "$W/pkgs.tsv"
+    : > "$W/deps.tsv"
+    : > "$W/prov.tsv"
+    for r in $REPOS; do
+        for d in "$W/db/$r"/*/desc; do
+            [ -f "$d" ] || continue
+            awk -v repo="$r" -v pk="$W/pkgs.tsv" -v dp="$W/deps.tsv" -v pv="$W/prov.tsv" '
+                function strip(x) { sub(/[<>=].*/, "", x); sub(/:.*/, "", x); return x }
+                /^%/ { sec = $0; next }
+                NF == 0 { next }
+                sec == "%NAME%" { name = $0 }
+                sec == "%FILENAME%" { file = $0 }
+                sec == "%DEPENDS%" { deps[++nd] = strip($0) }
+                sec == "%PROVIDES%" { prov[++np] = strip($0) }
+                END {
+                    printf "%s\t%s\t%s\n", name, repo, file >> pk
+                    for (i = 1; i <= nd; i++) printf "%s\t%s\n", name, deps[i] >> dp
+                    printf "%s\t%s\n", name, name >> pv
+                    for (i = 1; i <= np; i++) printf "%s\t%s\n", prov[i], name >> pv
+                }' "$d"
+        done
+    done
+}
+
+provider() {
+    local hit
+    hit=$(awk -F'\t' -v w="$1" '$1 == w && $1 == $2 { print $2; exit }' "$W/prov.tsv")
+    if [ -z "$hit" ]; then
+        hit=$(awk -F'\t' -v w="$1" '$1 == w { print $2; exit }' "$W/prov.tsv")
+    fi
+    printf '%s' "$hit"
+}
+
+ignored() {
+    local i
+    for i in $IGNORE; do
+        [ "$i" = "$1" ] && return 0
+    done
+    return 1
+}
+
+resolve() {
+    local queue n p d
+    queue=$*
+    : > "$W/want.txt"
+    while [ -n "$queue" ]; do
+        set -- $queue
+        n=$1
+        shift
+        queue=$*
+        ignored "$n" && continue
+        p=$(provider "$n")
+        if [ -z "$p" ]; then
+            say "not found in the repositories: $n"
+            continue
+        fi
+        ignored "$p" && continue
+        grep -qx "$p" "$W/want.txt" && continue
+        printf '%s\n' "$p" >> "$W/want.txt"
+        for d in $(awk -F'\t' -v n="$p" '$1 == n { print $2 }' "$W/deps.tsv"); do
+            queue="$queue $d"
+        done
+    done
+}
+
+fetch_one() {
+    local n=$1 repo file url
+    repo=$(awk -F'\t' -v n="$n" '$1 == n { print $2; exit }' "$W/pkgs.tsv")
+    file=$(awk -F'\t' -v n="$n" '$1 == n { print $3; exit }' "$W/pkgs.tsv")
+    [ -n "$file" ] || return 1
+    if [ ! -s "$CACHE/$file" ]; then
+        url=$(printf '%s' "$file" | sed 's/+/%2B/g')
+        curl -fsL -m 1800 -o "$CACHE/$file.part" "$MIRROR/$repo/os/x86_64/$url" || return 1
+        mv "$CACHE/$file.part" "$CACHE/$file"
+    fi
+    printf '%s' "$CACHE/$file"
+}
+
+fix_shebangs() {
+    local src=$1 f d
+    for d in "$src/usr/bin" "$src/usr/sbin"; do
+        [ -d "$d" ] || continue
+        for f in "$d"/*; do
+            [ -f "$f" ] && [ ! -L "$f" ] || continue
+            [ "$(head -c 2 "$f" 2>/dev/null)" = '#!' ] || continue
+            sed '1s|^#! */usr/|#!/System/|' "$f" > "$f.new" && cat "$f.new" > "$f"
+            rm -f "$f.new"
+        done
+    done
+}
+
+install_tree() {
+    local src=$1
+    fix_shebangs "$src"
+    mkdir -p "$ROOT/System/lib/glibc" "$ROOT/private/etc"
+    if [ -d "$src/usr/lib" ]; then
+        find "$src/usr/lib" -maxdepth 1 \( -type f -o -type l \) -name '*.so*' -exec cp -af {} "$ROOT/System/lib/glibc/" \; -exec rm -f {} \;
+    fi
+    if [ -d "$src/usr" ]; then
+        mkdir -p "$ROOT/System"
+        cp -an "$src/usr/." "$ROOT/System/"
+    fi
+    if [ -d "$src/etc" ]; then
+        cp -an "$src/etc/." "$ROOT/private/etc/"
+    fi
+    if [ -d "$src/opt" ]; then
+        mkdir -p "$ROOT/System/opt"
+        cp -an "$src/opt/." "$ROOT/System/opt/"
+    fi
+}
+
+load_db
+resolve "$@"
+total=$(wc -l < "$W/want.txt" | tr -d ' ')
+say "$total package(s) to install"
+while IFS= read -r p; do
+    say "  $p"
+    f=$(fetch_one "$p") || die "download of $p failed"
+    rm -rf "$W/x"
+    mkdir -p "$W/x"
+    bsdtar -xpf "$f" -C "$W/x" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL --exclude ./.CHANGELOG
+    install_tree "$W/x"
+    printf '%s\n' "$p" >> "$ROOT/private/var/lib/arch-fetch.list" 2>/dev/null || true
+done < "$W/want.txt"
+if command -v ldconfig >/dev/null 2>&1 && [ -z "$ROOT" ]; then
+    ldconfig 2>/dev/null || true
+fi
