@@ -15,7 +15,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
-#define PKG_VERSION "2026.10.10-1"
+#define PKG_VERSION "2026.10.10-3"
 #define CACHY "docker.io/cachyos/cachyos:latest"
 #define DAVB "ghcr.io/zelikos/davincibox:latest"
 #define PAC(x) "sudo pacman -Sy --noconfirm --needed " x
@@ -23,7 +23,7 @@
 #define MULTILIB "grep -q '^\\[multilib\\]' /etc/pacman.conf || printf '[multilib]\\nInclude = /etc/pacman.d/mirrorlist\\n' | sudo tee -a /etc/pacman.conf >/dev/null; "
 #define UPG "sudo pacman -Syu --noconfirm"
 
-typedef enum { K_CONTAINER, K_FLATPAK, K_NATIVE } kind_t;
+typedef enum { K_CONTAINER, K_FLATPAK, K_NATIVE, K_AUR } kind_t;
 
 typedef struct {
     const char *name;
@@ -40,6 +40,8 @@ typedef struct {
     const char *natpkgs;
     const char *post;
     const char *note;
+    const char *aur;
+    const char *session;
 } def_t;
 
 static const def_t catalog[] = {
@@ -82,6 +84,23 @@ static const def_t catalog[] = {
       .kind = K_CONTAINER, .image = CACHY, .inst = PACAUR("displaylink"),
       .exec = "DisplayLinkManager", .icon = "displaylink", .cat = "System;Settings;", .term = 1,
       .note = "the evdi kernel module must be provided by the host kernel" },
+    { .name = "niri", .app = "niri", .comment = "Scrollable-tiling Wayland compositor (native)",
+      .kind = K_NATIVE, .natpkgs = "niri xwayland-satellite foot fuzzel swaybg", .post = "session:niri",
+      .session = "niri", .note = "start it from a tty with: start-niri" },
+    { .name = "plasma", .aliases = "kde,kde-plasma", .app = "Plasma", .comment = "KDE Plasma desktop (native, Wayland)",
+      .kind = K_NATIVE, .natpkgs = "plasma-desktop plasma-workspace plasma-nm plasma-pa powerdevil kscreen xdg-desktop-portal-kde konsole dolphin", .post = "session:plasma",
+      .session = "startplasma-wayland", .note = "start it from a tty with: start-plasma. KWin expects logind, which this system does not have, so it may refuse to start; niri and mango are the safer choices" },
+    { .name = "dms", .aliases = "dank-material-shell,dankmaterialshell", .app = "DMS", .comment = "DankMaterialShell, a Quickshell desktop shell (native)",
+      .kind = K_NATIVE, .natpkgs = "dms-shell quickshell", .post = "session:none",
+      .note = "DMS is a shell, not a compositor: install niri or mango as well, start-niri and start-mango run it automatically" },
+    { .name = "mango", .aliases = "mangowc,mangowm", .app = "Mango", .comment = "Mango Wayland compositor (built from the AUR in a container)",
+      .kind = K_AUR, .aur = "mangowm-git", .image = CACHY,
+      .natpkgs = "wayland libinput libdrm libxkbcommon pixman libdisplay-info libliftoff hwdata seatd pcre2 xorg-xwayland libxcb foot", .post = "session:mango",
+      .session = "mango", .note = "mangowm-git comes from the AUR and pulls wlroots and scenefx, the first install builds them and takes a while" },
+    { .name = "noctalia", .aliases = "noctalia-shell", .app = "Noctalia", .comment = "Noctalia Quickshell desktop shell (built from the AUR in a container)",
+      .kind = K_AUR, .aur = "noctalia-qs noctalia-shell", .image = CACHY,
+      .natpkgs = "brightnessctl imagemagick python git", .post = "session:none",
+      .note = "Noctalia is a shell, not a compositor: install niri or mango as well. The launch command is not verified, start-niri tries noctalia-shell when DMS is not installed" },
     { .name = "docker", .app = "Docker", .comment = "Container engine (native, dinit service)",
       .kind = K_NATIVE, .natpkgs = "docker containerd runc iptables-nft docker-compose", .post = "docker" },
     { .name = "fish", .app = "fish", .comment = "Friendly interactive shell (native)",
@@ -97,7 +116,7 @@ static const char *DISTROBOX = "distrobox";
 static const char *FLATPAK = "flatpak";
 static const char *ARCHFETCH = "arch-fetch";
 static const char *PODMAN = "podman";
-static int opt_y, opt_n, opt_q;
+static int opt_y, opt_n, opt_q, opt_f;
 static uid_t tuid;
 static gid_t tgid;
 static char thome[512];
@@ -163,7 +182,6 @@ static int mkdir_p(const char *path, mode_t mode)
 static void find_user(void)
 {
     const char *want = getenv("PKG_USER");
-    struct passwd *pw = NULL;
     FILE *f;
     char line[1024];
     if (!want || !*want)
@@ -171,9 +189,8 @@ static void find_user(void)
     if ((!want || !*want) && geteuid() != 0) {
         tuid = geteuid();
         tgid = getegid();
-        pw = getpwuid(tuid);
-        snprintf(tname, sizeof tname, "%s", pw ? pw->pw_name : "user");
-        snprintf(thome, sizeof thome, "%s", getenv("HOME") ? getenv("HOME") : (pw ? pw->pw_dir : "/"));
+        snprintf(tname, sizeof tname, "%s", getenv("USER") ? getenv("USER") : "user");
+        snprintf(thome, sizeof thome, "%s", getenv("HOME") ? getenv("HOME") : "/");
         return;
     }
     f = fopen(pth("/private/etc/passwd"), "r");
@@ -274,7 +291,7 @@ static int confirm(void)
 
 static const char *kind_name(kind_t k)
 {
-    return k == K_CONTAINER ? "container" : k == K_FLATPAK ? "flatpak" : "native";
+    return k == K_CONTAINER ? "container" : k == K_FLATPAK ? "flatpak" : k == K_AUR ? "aur-build" : "native";
 }
 
 static int alias_match(const def_t *d, const char *s)
@@ -570,6 +587,30 @@ static void register_shell(const char *sh)
     }
 }
 
+static void write_session(const def_t *d)
+{
+    char path[512];
+    FILE *f;
+    mkdir_p(pth("/System/bin"), 0755);
+    snprintf(path, sizeof path, "%s", pth("/System/bin/start-%s", d->name));
+    f = fopen(path, "w");
+    if (!f)
+        return;
+    fprintf(f, "#!/System/bin/busybox sh\n. /System/lib/fasdeqos/desktop-env\n");
+    if (strcmp(d->name, "plasma")) {
+        fprintf(f, "if [ -x /System/bin/dms ]; then\n    /System/bin/dms run &\nelif [ -x /System/bin/noctalia-shell ]; then\n    /System/bin/noctalia-shell &\nfi\n");
+    }
+    fprintf(f, "exec %s\n", d->session);
+    fclose(f);
+    chmod(path, 0755);
+    mkdir_p(pth("/System/share/wayland-sessions"), 0755);
+    f = fopen(pth("/System/share/wayland-sessions/%s.desktop", d->name), "w");
+    if (f) {
+        fprintf(f, "[Desktop Entry]\nName=%s\nExec=/System/bin/start-%s\nType=Application\n", d->app, d->name);
+        fclose(f);
+    }
+}
+
 static void post_native(const def_t *d)
 {
     if (!d->post)
@@ -580,6 +621,8 @@ static void post_native(const def_t *d)
         snprintf(sh, sizeof sh, "/System/bin/%s", d->post + 6);
         register_shell(sh);
     }
+    if (!strncmp(d->post, "session:", 8) && strcmp(d->post + 8, "none"))
+        write_session(d);
     if (!strcmp(d->post, "docker")) {
         mkdir_p(pth("/private/etc/dinit.d/boot.d"), 0755);
         write_text(pth("/private/etc/dinit.d/docker"),
@@ -600,33 +643,32 @@ static void refresh_libs(void)
         runv(0, "ldconfig", NULL);
 }
 
-static int install_native(const def_t *d)
+static int run_fetch(const char *stage, const char *natpkgs, const char *record, int soft)
 {
-    char stage[1024];
-    char *argv[48];
-    char buf[512], *t, *sv = NULL;
-    int n = 0, rc;
-    FILE *man;
-    if (geteuid() != 0) {
-        fprintf(stderr, "pkg: %s is a native package, root is required (try: su -c 'pkg install %s')\n", d->name, d->name);
-        return 1;
-    }
-    snprintf(stage, sizeof stage, "%s/Library/pkg/stage/%s", P_ROOT, d->name);
-    rm_tree(stage);
-    mkdir_p(stage, 0755);
+    char *argv[64];
+    char buf[1024], *t, *sv = NULL;
+    int n = 0;
     argv[n++] = (char *)ARCHFETCH;
     argv[n++] = "--quiet";
+    if (soft)
+        argv[n++] = "--soft";
+    if (record) {
+        argv[n++] = "--record";
+        argv[n++] = (char *)record;
+    }
     argv[n++] = "--root";
-    argv[n++] = stage;
-    snprintf(buf, sizeof buf, "%s", d->natpkgs);
-    for (t = strtok_r(buf, " ", &sv); t && n < 46; t = strtok_r(NULL, " ", &sv))
+    argv[n++] = (char *)stage;
+    snprintf(buf, sizeof buf, "%s", natpkgs);
+    for (t = strtok_r(buf, " ", &sv); t && n < 62; t = strtok_r(NULL, " ", &sv))
         argv[n++] = strdup(t);
     argv[n] = NULL;
-    rc = runvp(0, argv);
-    if (rc) {
-        rm_tree(stage);
-        return rc;
-    }
+    return runvp(0, argv);
+}
+
+static int commit_stage(const def_t *d, const char *stage)
+{
+    FILE *man;
+    rec_t r;
     mkdir_p(db_dir(), 0755);
     man = fopen(pth("/Library/pkg/db/%s.files", d->name), "w");
     if (!man) {
@@ -634,18 +676,125 @@ static int install_native(const def_t *d)
         return 1;
     }
     copy_tree(stage, "", man);
-    fclose(man);
     rm_tree(stage);
     post_native(d);
+    if (d->post && !strncmp(d->post, "session:", 8) && strcmp(d->post + 8, "none"))
+        fprintf(man, "F /System/bin/start-%s\nF /System/share/wayland-sessions/%s.desktop\n", d->name, d->name);
+    if (d->post && !strcmp(d->post, "docker"))
+        fprintf(man, "F /private/etc/dinit.d/docker\nF /private/etc/dinit.d/boot.d/docker\n");
+    fclose(man);
     refresh_libs();
-    {
-        rec_t r;
-        memset(&r, 0, sizeof r);
-        snprintf(r.kind, sizeof r.kind, "native");
-        snprintf(r.app, sizeof r.app, "%s", d->app);
-        r.when = (long)time(NULL);
-        return write_rec(d->name, &r);
+    memset(&r, 0, sizeof r);
+    snprintf(r.kind, sizeof r.kind, "native");
+    snprintf(r.app, sizeof r.app, "%s", d->app);
+    r.when = (long)time(NULL);
+    return write_rec(d->name, &r);
+}
+
+static int need_root(const def_t *d)
+{
+    if (geteuid() == 0)
+        return 0;
+    fprintf(stderr, "pkg: %s is a native package, root is required (try: su -c 'pkg install %s')\n", d->name, d->name);
+    return 1;
+}
+
+static int install_native(const def_t *d)
+{
+    char stage[1024];
+    int rc;
+    if (need_root(d))
+        return 1;
+    snprintf(stage, sizeof stage, "%s/Library/pkg/stage/%s", P_ROOT, d->name);
+    rm_tree(stage);
+    mkdir_p(stage, 0755);
+    mkdir_p(db_dir(), 0755);
+    rc = run_fetch(stage, d->natpkgs, pth("/Library/pkg/db/%s.ver", d->name), 0);
+    if (rc) {
+        rm_tree(stage);
+        return rc;
     }
+    return commit_stage(d, stage);
+}
+
+static int install_aur(const def_t *d)
+{
+    char stage[1024], build[1024], home[1100], out[1200], cmd[2048], line[512];
+    char *argv[200];
+    int n = 0, rc, i;
+    FILE *p;
+    DIR *dir;
+    struct dirent *e;
+    char *files[128];
+    int nf = 0;
+    if (need_root(d))
+        return 1;
+    snprintf(build, sizeof build, "%s/Library/pkg/build", P_ROOT);
+    snprintf(home, sizeof home, "%s/home", build);
+    snprintf(out, sizeof out, "%s/out", home);
+    mkdir_p(home, 0755);
+    chown_tree(build);
+    runv(1, DISTROBOX, "create", "--yes", "--name", "pkg-build", "--image", d->image, "--home", home, "--no-entry", NULL);
+    snprintf(cmd, sizeof cmd,
+             "sudo pacman -Sy --noconfirm --needed base-devel git paru && rm -rf \"$HOME/out\" \"$HOME/.cache/paru/clone\" && mkdir -p \"$HOME/out\" && "
+             "paru -S --noconfirm --needed --skipreview %s && find \"$HOME/.cache/paru/clone\" -name '*.pkg.tar.*' ! -name '*-debug-*' -exec cp {} \"$HOME/out/\" \\;",
+             d->aur);
+    rc = runv(1, DISTROBOX, "enter", "-n", "pkg-build", "--", "sh", "-c", cmd, NULL);
+    if (rc)
+        return rc;
+    dir = opendir(out);
+    while (dir && (e = readdir(dir)) && nf < 127) {
+        if (strstr(e->d_name, ".pkg.tar")) {
+            char fp[1400];
+            snprintf(fp, sizeof fp, "%s/%s", out, e->d_name);
+            files[nf++] = strdup(fp);
+        }
+    }
+    if (dir)
+        closedir(dir);
+    if (!nf) {
+        fprintf(stderr, "pkg: the build produced no packages\n");
+        return 1;
+    }
+    snprintf(stage, sizeof stage, "%s/Library/pkg/stage/%s", P_ROOT, d->name);
+    rm_tree(stage);
+    mkdir_p(stage, 0755);
+    argv[n++] = (char *)ARCHFETCH;
+    argv[n++] = "--extract";
+    argv[n++] = "--root";
+    argv[n++] = stage;
+    for (i = 0; i < nf; i++)
+        argv[n++] = files[i];
+    argv[n] = NULL;
+    rc = runvp(0, argv);
+    if (rc) {
+        rm_tree(stage);
+        return rc;
+    }
+    {
+        char deps[8192] = "";
+        snprintf(cmd, sizeof cmd, "%s --deps", ARCHFETCH);
+        for (i = 0; i < nf; i++) {
+            strncat(cmd, " '", sizeof cmd - strlen(cmd) - 1);
+            strncat(cmd, files[i], sizeof cmd - strlen(cmd) - 1);
+            strncat(cmd, "'", sizeof cmd - strlen(cmd) - 1);
+        }
+        p = popen(cmd, "r");
+        while (p && fgets(line, sizeof line, p)) {
+            line[strcspn(line, "\n")] = 0;
+            if (strlen(deps) + strlen(line) + 2 < sizeof deps) {
+                strcat(deps, line);
+                strcat(deps, " ");
+            }
+        }
+        if (p)
+            pclose(p);
+        strncat(deps, d->natpkgs, sizeof deps - strlen(deps) - 1);
+        run_fetch(stage, deps, pth("/Library/pkg/db/%s.ver", d->name), 1);
+    }
+    for (i = 0; i < nf; i++)
+        free(files[i]);
+    return commit_stage(d, stage);
 }
 
 static int remove_native(const char *name)
@@ -677,6 +826,7 @@ static int remove_native(const char *name)
     }
     free(lines);
     unlink(pth("/Library/pkg/db/%s.files", name));
+    unlink(pth("/Library/pkg/db/%s.ver", name));
     return 0;
 }
 
@@ -689,7 +839,7 @@ static int installed_list(char names[][64], int max)
         return 0;
     while ((e = readdir(d)) && n < max) {
         size_t l = strlen(e->d_name);
-        if (e->d_name[0] == '.' || (l > 6 && !strcmp(e->d_name + l - 6, ".files")))
+        if (e->d_name[0] == '.' || (l > 6 && !strcmp(e->d_name + l - 6, ".files")) || (l > 4 && !strcmp(e->d_name + l - 4, ".ver")))
             continue;
         snprintf(names[n++], 64, "%s", e->d_name);
     }
@@ -747,6 +897,7 @@ static int cmd_install(int argc, char **argv)
         switch (todo[i]->kind) {
         case K_CONTAINER: r = install_container(todo[i]); break;
         case K_FLATPAK: r = install_flatpak(todo[i]); break;
+        case K_AUR: r = install_aur(todo[i]); break;
         default: r = install_native(todo[i]); break;
         }
         if (r) {
@@ -935,48 +1086,127 @@ static int cmd_list(int argc, char **argv)
     return 0;
 }
 
+static int check_native(const char *name, char *names, size_t cap, int show)
+{
+    char cmd[2048], line[1024];
+    FILE *p;
+    int n = 0;
+    struct stat st;
+    const char *ver = pth("/Library/pkg/db/%s.ver", name);
+    if (stat(ver, &st))
+        return 0;
+    snprintf(cmd, sizeof cmd, "%s --quiet --check --list '%s' 2>/dev/null", ARCHFETCH, ver);
+    p = popen(cmd, "r");
+    while (p && fgets(line, sizeof line, p)) {
+        char *a, *b, *c;
+        line[strcspn(line, "\n")] = 0;
+        a = line;
+        b = strchr(a, '\t');
+        if (!b)
+            continue;
+        *b++ = 0;
+        c = strchr(b, '\t');
+        if (!c)
+            continue;
+        *c++ = 0;
+        if (show)
+            say("\t%s: %s -> %s  (%s)\n", a, b, c, name);
+        if (names && strlen(names) + strlen(a) + 2 < cap) {
+            strcat(names, a);
+            strcat(names, " ");
+        }
+        n++;
+    }
+    if (p)
+        pclose(p);
+    return n;
+}
+
 static int cmd_update(void)
 {
-    say("Updating fasdeqos repository catalogue...\nfasdeqos repository is up to date.\nAll repositories are up to date.\n");
+    char names[256][64];
+    int n = installed_list(names, 256), i, total = 0, cont = 0;
+    say("Updating fasdeqos repository catalogue...\nfasdeqos repository is up to date.\nFetching Arch package databases for native packages...\n");
+    for (i = 0; i < n; i++) {
+        rec_t r;
+        if (!read_rec(names[i], &r))
+            continue;
+        if (!strcmp(r.kind, "container") || !strcmp(r.kind, "flatpak"))
+            cont++;
+        else {
+            if (!total)
+                say("Upgrades available:\n");
+            total += check_native(names[i], NULL, 0, 1);
+        }
+    }
+    say("%d native package(s) can be upgraded, %d application(s) in containers or flatpak are checked while upgrading.\n", total, cont);
     return 0;
 }
 
 static int cmd_upgrade(void)
 {
     char names[256][64];
-    int n = installed_list(names, 256), i, rc = 0;
-    if (!n) {
-        say("Nothing to do.\n");
-        return 0;
-    }
-    say("Updating fasdeqos repository catalogue...\nChecking for upgrades (%d candidates)...\n", n);
-    if (opt_n) {
-        say("Dry run: would upgrade %d package(s).\n", n);
-        return 0;
-    }
-    if (!opt_y && !confirm())
-        return 1;
+    char out[256][4096];
+    int n = installed_list(names, 256), i, total = 0, cont = 0, rc = 0;
+    memset(out, 0, sizeof out);
+    say("Updating fasdeqos repository catalogue...\nChecking for upgrades...\n");
+    say("\nInstalled packages to be UPGRADED:\n");
     for (i = 0; i < n; i++) {
         rec_t r;
-        const def_t *d = find_def(names[i]);
         if (!read_rec(names[i], &r))
             continue;
-        say("[%d/%d] Upgrading %s-rolling...\n", i + 1, n, names[i]);
-        if (!strcmp(r.kind, "container"))
+        if (!strcmp(r.kind, "container") || !strcmp(r.kind, "flatpak")) {
+            say("\t%s: container or flatpak application, updated in place\n", names[i]);
+            cont++;
+        } else
+            total += check_native(names[i], out[i], sizeof out[i], 1);
+    }
+    if (!total && !cont) {
+        say("Your packages are up to date.\n");
+        return 0;
+    }
+    say("\nNumber of packages to be upgraded: %d native, %d application(s)\n", total, cont);
+    if (opt_n)
+        return 0;
+    if (!confirm()) {
+        say("Aborted.\n");
+        return 1;
+    }
+    for (i = 0; i < n; i++) {
+        rec_t r;
+        if (!read_rec(names[i], &r))
+            continue;
+        if (!strcmp(r.kind, "container")) {
+            say("Upgrading %s...\n", names[i]);
             rc |= runv(1, DISTROBOX, "upgrade", r.container, NULL);
-        else if (!strcmp(r.kind, "flatpak"))
+        } else if (!strcmp(r.kind, "flatpak")) {
+            say("Upgrading %s...\n", names[i]);
             rc |= runv(1, FLATPAK, "update", "--user", "-y", "--noninteractive", r.container, NULL);
-        else if (d && geteuid() == 0) {
-            char *argv[48];
-            char buf[512], *t, *sv = NULL;
+        } else if (out[i][0]) {
+            char *argv[96];
+            char *t, *sv = NULL;
             int k = 0;
+            if (geteuid() != 0) {
+                fprintf(stderr, "pkg: %s needs root to upgrade (try: su -c 'pkg upgrade')\n", names[i]);
+                rc = 1;
+                continue;
+            }
+            say("Upgrading %s...\n", names[i]);
             argv[k++] = (char *)ARCHFETCH;
             argv[k++] = "--quiet";
-            snprintf(buf, sizeof buf, "%s", d->natpkgs);
-            for (t = strtok_r(buf, " ", &sv); t && k < 46; t = strtok_r(NULL, " ", &sv))
-                argv[k++] = strdup(t);
+            argv[k++] = "--force";
+            argv[k++] = "--soft";
+            argv[k++] = "--record";
+            argv[k++] = pth("/Library/pkg/db/%s.ver", names[i]);
+            if (*P_ROOT) {
+                argv[k++] = "--root";
+                argv[k++] = (char *)P_ROOT;
+            }
+            for (t = strtok_r(out[i], " ", &sv); t && k < 94; t = strtok_r(NULL, " ", &sv))
+                argv[k++] = t;
             argv[k] = NULL;
             rc |= runvp(0, argv);
+            refresh_libs();
         }
     }
     return rc;
@@ -1137,6 +1367,46 @@ static void usage(void)
            "Aliases: remove, rm -> delete; autoremove, clean -> gc\n");
 }
 
+static int wants_root(const char *cmd, int nr, char **rest)
+{
+    int i;
+    if (!strcmp(cmd, "install") || !strcmp(cmd, "add") || !strcmp(cmd, "delete") || !strcmp(cmd, "remove") || !strcmp(cmd, "rm")) {
+        for (i = 0; i < nr; i++) {
+            const def_t *d = find_def(rest[i]);
+            if (d && (d->kind == K_NATIVE || d->kind == K_AUR))
+                return 1;
+        }
+        return 0;
+    }
+    if (!strcmp(cmd, "upgrade")) {
+        char names[256][64];
+        int n = installed_list(names, 256);
+        for (i = 0; i < n; i++) {
+            rec_t r;
+            if (read_rec(names[i], &r) && (!strcmp(r.kind, "native") || !strcmp(r.kind, "aur")))
+                return 1;
+        }
+    }
+    return 0;
+}
+
+static void escalate(int argc, char **argv)
+{
+    char line[4096] = "exec ";
+    int i;
+    strncat(line, argv[0], sizeof line - strlen(line) - 1);
+    for (i = 1; i < argc; i++) {
+        strncat(line, " '", sizeof line - strlen(line) - 1);
+        strncat(line, argv[i], sizeof line - strlen(line) - 1);
+        strncat(line, "'", sizeof line - strlen(line) - 1);
+    }
+    fprintf(stderr, "pkg: root is required, switching with su (root password)\n");
+    setenv("PKG_NO_SU", "1", 1);
+    execlp("su", "su", "-c", line, (char *)NULL);
+    fprintf(stderr, "pkg: cannot run su: %s\n", strerror(errno));
+    exit(1);
+}
+
 int main(int argc, char **argv)
 {
     char *rest[256];
@@ -1161,6 +1431,8 @@ int main(int argc, char **argv)
             opt_n = 1;
         else if (!strcmp(argv[i], "-q") || !strcmp(argv[i], "--quiet"))
             opt_q = 1;
+        else if (!strcmp(argv[i], "-f") || !strcmp(argv[i], "--force"))
+            opt_f = 1;
         else if (!cmd)
             cmd = argv[i];
         else if (nr < 255)
@@ -1172,6 +1444,8 @@ int main(int argc, char **argv)
         return 1;
     }
     find_user();
+    if (geteuid() != 0 && !getenv("PKG_NO_SU") && !opt_n && wants_root(cmd, nr, rest))
+        escalate(argc, argv);
     if (!strcmp(cmd, "install") || !strcmp(cmd, "add"))
         rc = nr ? cmd_install(nr, rest) : (usage(), 1);
     else if (!strcmp(cmd, "delete") || !strcmp(cmd, "remove") || !strcmp(cmd, "rm"))

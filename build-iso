@@ -1,7 +1,7 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.10-11
+VERSION=2026.10.10-13
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
@@ -16,6 +16,8 @@ NVIDIA=1
 GPU=1
 BROADCOM=1
 STACK_PKGS="distrobox podman crun conmon netavark aardvark-dns fuse-overlayfs slirp4netns shadow flatpak bubblewrap xdg-dbus-proxy curl libarchive git"
+DESK_PKGS="dbus seatd pipewire pipewire-pulse pipewire-alsa wireplumber alsa-utils alsa-ucm-conf libinput xkeyboard-config polkit"
+SHELLS=""
 GPU_PKGS="mesa vulkan-icd-loader vulkan-radeon vulkan-intel libdrm nvidia-utils"
 FW_PKGS="linux-firmware-whence linux-firmware-amdgpu linux-firmware-atheros linux-firmware-broadcom linux-firmware-cirrus linux-firmware-intel linux-firmware-mediatek linux-firmware-nvidia linux-firmware-other linux-firmware-radeon linux-firmware-realtek"
 TOOL_PKGS="kmod xz zstd zlib-ng-compat openssl"
@@ -29,11 +31,12 @@ while [ $# -gt 0 ]; do
         --out) OUT=$2; shift ;;
         --rebuild) REBUILD=1 ;;
         --no-firmware) FIRMWARE=0 ;;
+        --shells) SHELLS=$2; shift ;;
         --no-nvidia) NVIDIA=0 ;;
         --no-gpu-userspace) GPU=0 ;;
         --lean) FIRMWARE=0; NVIDIA=0; GPU=0; BROADCOM=0 ;;
         -h|--help)
-            printf 'usage: build-iso [--root DIR] [--out FILE.iso] [--rebuild] [--lean] [--no-firmware] [--no-nvidia] [--no-gpu-userspace]\n'
+            printf 'usage: build-iso [--root DIR] [--out FILE.iso] [--rebuild] [--shells 'niri dms mango plasma'] [--lean] [--no-firmware] [--no-nvidia] [--no-gpu-userspace]\n'
             exit 0 ;;
         *) die "unknown option: $1" ;;
     esac
@@ -158,7 +161,80 @@ add_glibc_ldconfig() {
 
 arch_stack() {
     local list=$1
-    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --root "$ROOT" $list || die "arch-fetch failed for: $list"
+    mkdir -p "$ROOT/Library/pkg/db"
+    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" $list || die "arch-fetch failed for: $list"
+}
+
+arch_stack_soft() {
+    local list=$1
+    shift
+    mkdir -p "$ROOT/Library/pkg/db"
+    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --soft --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" "$@" || say "warning: arch-fetch failed for part of: $list"
+}
+
+add_udev() {
+    local t=$WORK/hw f
+    say "Installing udev from the Arch systemd package"
+    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --soft --allow systemd --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" systemd || { say "warning: udev could not be installed"; return 0; }
+    for f in systemctl journalctl loginctl machinectl networkctl resolvectl timedatectl hostnamectl localectl busctl coredumpctl bootctl homectl userdbctl portablectl systemd-run systemd-analyze systemd-nspawn systemd-cgls systemd-cgtop systemd-tmpfiles systemd-sysusers systemd-firstboot systemd-repart systemd-sysext systemd-confext systemd-mount systemd-umount systemd-ask-password systemd-tty-ask-password-agent systemd-inhibit systemd-cat systemd-notify systemd-escape systemd-id128 systemd-path systemd-delta systemd-detect-virt systemd-machine-id-setup kernel-install; do
+        rm -f "$ROOT/System/bin/$f"
+    done
+    mkdir -p "$ROOT/private/etc/udev/rules.d"
+    if [ -d "$ROOT/System/lib/udev/rules.d" ]; then
+        cp -a "$ROOT/System/lib/udev/rules.d/." "$ROOT/private/etc/udev/rules.d/"
+        for f in "$ROOT"/private/etc/udev/rules.d/*.rules; do
+            sed 's|/usr/lib/udev|/System/lib/udev|g; s|/usr/bin/|/System/bin/|g; s|/usr/sbin/|/System/bin/|g' "$f" > "$f.new" && cat "$f.new" > "$f"
+            rm -f "$f.new"
+        done
+    fi
+    if command -v udevadm >/dev/null 2>&1 && [ -d "$ROOT/System/lib/udev/hwdb.d" ]; then
+        mkdir -p "$t/usr/lib/udev"
+        cp -a "$ROOT/System/lib/udev/hwdb.d" "$t/usr/lib/udev/"
+        udevadm hwdb --update --usr --root="$t" >/dev/null 2>&1 || true
+        [ -f "$t/usr/lib/udev/hwdb.bin" ] && cp "$t/usr/lib/udev/hwdb.bin" "$ROOT/private/etc/udev/hwdb.bin"
+    fi
+    [ -e "$ROOT/System/lib/systemd/systemd-udevd" ] || say "warning: systemd-udevd is missing after the install"
+}
+
+add_desktop_base() {
+    say "Installing PipeWire, seatd, dbus and input support"
+    arch_stack_soft "$DESK_PKGS" $DESK_PKGS
+    add_udev
+    mkdir -p "$ROOT/System/lib/fasdeqos"
+    cat > "$ROOT/System/lib/fasdeqos/desktop-env" <<'DENV'
+export XDG_RUNTIME_DIR=/run/user/$(id -u)
+export XDG_DATA_DIRS=/System/share:/home/linuxbrew/.linuxbrew/share
+export XDG_CONFIG_DIRS=/private/etc/xdg
+export XDG_SESSION_TYPE=wayland
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$XDG_RUNTIME_DIR/bus
+export LIBSEAT_BACKEND=seatd
+export SEATD_SOCK=/run/seatd.sock
+export QT_PLUGIN_PATH=/System/lib/qt6/plugins
+export QML_IMPORT_PATH=/System/lib/qt6/qml
+export QML2_IMPORT_PATH=/System/lib/qt6/qml
+export LIBGL_DRIVERS_PATH=/System/lib/dri
+export GBM_BACKENDS_PATH=/System/lib/gbm
+export __EGL_VENDOR_LIBRARY_DIRS=/System/share/glvnd/egl_vendor.d
+export XKB_CONFIG_ROOT=/System/share/X11/xkb
+export SPA_PLUGIN_DIR=/System/lib/spa-0.2
+export PIPEWIRE_MODULE_DIR=/System/lib/pipewire-0.3
+export PIPEWIRE_CONFIG_DIR=/System/share/pipewire
+export WIREPLUMBER_DATA_DIR=/System/share/wireplumber
+export WIREPLUMBER_MODULE_DIR=/System/lib/wireplumber-0.5
+export WIREPLUMBER_CONFIG_DIR=/System/share/wireplumber
+export ALSA_CONFIG_DIR=/System/share/alsa
+export ALSA_PLUGIN_DIR=/System/lib/alsa-lib
+export GIO_MODULE_DIR=/System/lib/gio/modules
+DENV
+}
+
+add_shells() {
+    local s
+    [ -n "$SHELLS" ] || return 0
+    for s in $SHELLS; do
+        say "Installing $s into the image through pkg"
+        PKG_ROOT="$ROOT" PKG_USER=root PKG_ARCH_FETCH="$HERE/arch-fetch" ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" "$ROOT/System/bin/pkg" -y install "$s" || say "warning: $s could not be installed into the image"
+    done
 }
 
 add_pkg_stack() {
@@ -185,6 +261,20 @@ add_pkg_stack() {
     fi
     cp "$HERE/arch-fetch" "$ROOT/System/bin/arch-fetch"
     chmod 755 "$ROOT/System/bin/arch-fetch"
+    printf 'kind=native\napp=base\nbundle=\ncontainer=\nlink=\nwhen=%s\n' "$(date +%s)" > "$ROOT/Library/pkg/db/base"
+}
+
+fix_auth() {
+    local p=$ROOT/private/etc/pam.d u=/System/lib/security
+    say "Fixing su and PAM"
+    rm -f "$ROOT/System/bin/su"
+    cp "$ROOT/System/bin/busybox" "$ROOT/System/bin/su"
+    chmod 4755 "$ROOT/System/bin/su"
+    mkdir -p "$p"
+    for f in other su su-l passwd chpasswd login system-auth polkit-1; do
+        rm -f "$p/$f"
+        printf 'auth sufficient %s/pam_rootok.so\nauth required %s/pam_unix.so\naccount required %s/pam_unix.so\npassword required %s/pam_unix.so sha512 shadow nullok\nsession required %s/pam_unix.so\n' "$u" "$u" "$u" "$u" "$u" > "$p/$f"
+    done
 }
 
 build_pkg() {
@@ -212,16 +302,20 @@ STORE
 build_ld_cache() {
     local t=$WORK/ldroot
     say "Building the glibc library cache"
-    mkdir -p "$t/System/lib/glibc" "$t/etc"
+    mkdir -p "$t/System/lib/glibc" "$t/System/lib/systemd" "$t/etc"
+    mkdir -p "$ROOT/System/lib/systemd"
     mount --bind "$ROOT/System/lib/glibc" "$t/System/lib/glibc" || die "bind mount for the library cache failed"
-    printf '/System/lib/glibc\n' > "$t/etc/ld.so.conf"
+    mount --bind "$ROOT/System/lib/systemd" "$t/System/lib/systemd" || { umount "$t/System/lib/glibc"; die "bind mount for the library cache failed"; }
+    printf '/System/lib/glibc\n/System/lib/systemd\n' > "$t/etc/ld.so.conf"
     if ! ldconfig -r "$t"; then
+        umount "$t/System/lib/systemd" || true
         umount "$t/System/lib/glibc" || true
         die "ldconfig failed"
     fi
+    umount "$t/System/lib/systemd" || die "umount failed"
     umount "$t/System/lib/glibc" || die "umount failed"
     cp "$t/etc/ld.so.cache" "$ROOT/private/etc/ld.so.cache"
-    printf '/System/lib/glibc\n' > "$ROOT/private/etc/ld.so.conf"
+    printf '/System/lib/glibc\n/System/lib/systemd\n' > "$ROOT/private/etc/ld.so.conf"
 }
 
 add_busybox() {
@@ -341,9 +435,9 @@ write_users() {
         rm -f "$ROOT/private/etc/$f"
     done
     h=$(openssl passwd -6 "$PASSWORD")
-    printf 'root:x:0:0:root:/root:/System/bin/bash\n%s:x:1000:1000:%s:/Users/%s:/System/bin/bash\nnobody:x:65534:65534:nobody:/:/System/bin/false\n' "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/passwd"
-    printf 'root:x:0:\nwheel:x:10:%s\nusers:x:100:\n%s:x:1000:\nnobody:x:65534:\n' "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/group"
-    printf 'root:%s:19000:0:99999:7:::\n%s:%s:19000:0:99999:7:::\nnobody:!:19000:::::::\n' "$h" "$LIVEUSER" "$h" > "$ROOT/private/etc/shadow"
+    printf 'root:x:0:0:root:/root:/System/bin/bash\n%s:x:1000:1000:%s:/Users/%s:/System/bin/bash\nmessagebus:x:81:81:dbus:/:/System/bin/false\nnobody:x:65534:65534:nobody:/:/System/bin/false\n' "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/passwd"
+    printf 'root:x:0:\nwheel:x:10:%s\naudio:x:11:%s\nvideo:x:12:%s\nseat:x:27:%s\ninput:x:97:%s\nrender:x:105:%s\nmessagebus:x:81:\nusers:x:100:\n%s:x:1000:\nnobody:x:65534:\n' "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" "$LIVEUSER" > "$ROOT/private/etc/group"
+    printf 'root:%s:19000:0:99999:7:::\n%s:%s:19000:0:99999:7:::\nmessagebus:!:19000:::::::\nnobody:!:19000:::::::\n' "$h" "$LIVEUSER" "$h" > "$ROOT/private/etc/shadow"
     chmod 600 "$ROOT/private/etc/shadow"
     printf '/System/bin/bash\n/System/bin/sh\n' > "$ROOT/private/etc/shells"
     mkdir -p "$ROOT/Users/$LIVEUSER"
@@ -357,8 +451,10 @@ export PATH=/System/lib/fasdeqos/bin:/System/bin:/home/linuxbrew/.linuxbrew/bin:
 export TERM=${TERM:-linux}
 export TERMINFO=/System/share/terminfo
 export PS1='\u@\h \w % '
-export XDG_DATA_DIRS=/System/share:/home/linuxbrew/.linuxbrew/share
 export XDG_RUNTIME_DIR=/run/user/$(id -u)
+if [ -f /System/lib/fasdeqos/desktop-env ]; then
+    . /System/lib/fasdeqos/desktop-env
+fi
 if [ -z "$FASD_SHOWN" ] && [ -t 1 ]; then
     FASD_SHOWN=1
     export FASD_SHOWN
@@ -366,6 +462,38 @@ if [ -z "$FASD_SHOWN" ] && [ -t 1 ]; then
 fi
 export HOME=${HOME:-/Users}
 PROF
+}
+
+write_services() {
+    local d=$ROOT/private/etc/dinit.d b=$ROOT/System/lib/fasdeqos/bin s
+    mkdir -p "$d/boot.d" "$b"
+    cat > "$b/svc-dbus" <<'S1'
+#!/System/bin/busybox sh
+mkdir -p /run/dbus
+exec /System/bin/dbus-daemon --system --nofork --nopidfile --config-file=/System/share/dbus-1/system.conf
+S1
+    cat > "$b/svc-user" <<'S2'
+#!/System/bin/busybox sh
+. /System/lib/fasdeqos/desktop-env
+mkdir -p "$XDG_RUNTIME_DIR"
+case $1 in
+    dbus) exec /System/bin/dbus-daemon --session --nofork --nopidfile --address="$DBUS_SESSION_BUS_ADDRESS" --config-file=/System/share/dbus-1/session.conf ;;
+    pipewire) exec /System/bin/pipewire ;;
+    wireplumber) exec /System/bin/wireplumber ;;
+    pulse) exec /System/bin/pipewire-pulse ;;
+esac
+S2
+    chmod +x "$b/svc-dbus" "$b/svc-user"
+    printf 'type = process\ncommand = /System/lib/fasdeqos/bin/svc-dbus\nrestart = true\n' > "$d/dbus-system"
+    printf 'type = process\ncommand = /System/bin/seatd -g seat\nrestart = true\n' > "$d/seatd"
+    printf 'type = process\ncommand = /System/lib/fasdeqos/bin/svc-user dbus\nrun-as = %s\nrestart = true\ndepends-on = dbus-system\n' "$LIVEUSER" > "$d/dbus-session"
+    printf 'type = process\ncommand = /System/lib/fasdeqos/bin/svc-user pipewire\nrun-as = %s\nrestart = true\ndepends-on = dbus-session\n' "$LIVEUSER" > "$d/pipewire"
+    printf 'type = process\ncommand = /System/lib/fasdeqos/bin/svc-user wireplumber\nrun-as = %s\nrestart = true\ndepends-on = pipewire\n' "$LIVEUSER" > "$d/wireplumber"
+    printf 'type = process\ncommand = /System/lib/fasdeqos/bin/svc-user pulse\nrun-as = %s\nrestart = true\ndepends-on = pipewire\n' "$LIVEUSER" > "$d/pipewire-pulse"
+    for s in dbus-system seatd dbus-session pipewire wireplumber pipewire-pulse; do
+        rm -f "$d/boot.d/$s"
+        ln -s "../$s" "$d/boot.d/$s"
+    done
 }
 
 write_init() {
@@ -392,8 +520,15 @@ busybox find /sys/devices -name modalias -type f 2>/dev/null | busybox xargs bus
 for m in fuse tun overlay veth bridge br_netfilter nf_tables nft_masq nft_nat nft_chain_nat nf_nat xt_MASQUERADE xt_conntrack xt_addrtype nf_conntrack; do
     /System/bin/modprobe -q "$m" 2>/dev/null
 done
+if [ -x /System/lib/systemd/systemd-udevd ]; then
+    busybox mkdir -p /run/udev
+    /System/lib/systemd/systemd-udevd --daemon 2>/dev/null
+    /System/bin/udevadm trigger --action=add 2>/dev/null
+    /System/bin/udevadm settle --timeout=15 2>/dev/null
+fi
 echo 'fasdeqOS live system'
 RC
+    write_services
     cat > "$ROOT/System/bin/fasdeqos-session" <<'SES'
 #!/System/bin/busybox sh
 export PATH=/System/lib/fasdeqos/bin:/System/bin:/bin
@@ -588,7 +723,10 @@ add_gcc_libs
 add_fastfetch
 add_glibc_ldconfig
 add_pkg_stack
+add_desktop_base
+fix_auth
 build_pkg
+add_shells
 build_ld_cache
 write_os_release
 write_users
