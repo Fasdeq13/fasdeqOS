@@ -1,21 +1,21 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.10-13
+VERSION=2026.10.10-15
 HERE=$(cd "$(dirname "$0")" && pwd)
 ROOT=./darwin/rootfs
 OUT=./darwin/fasdeqos-live.iso
 LIVEUSER=fasdeqos
 PASSWORD=fasdeqos
 BUSYBOX_URL=https://busybox.net/downloads/binaries/1.35.0-x86_64-linux-musl/busybox
-MIRRORS="https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux https://mirror.rackspace.com/archlinux"
+MIRRORS="https://geo.mirror.pkgbuild.com https://mirror.rackspace.com/archlinux https://mirrors.kernel.org/archlinux https://mirror.yandex.ru/archlinux https://mirror.truenetwork.ru/archlinux https://ftp.halifax.rwth-aachen.de/archlinux https://mirror.23m.com/archlinux https://mirror.cyberbits.eu/archlinux https://mirror.leaseweb.net/archlinux https://ftp.snt.utwente.nl/pub/linux/archlinux https://mirrors.dotsrc.org/archlinux https://mirror.osbeck.com/archlinux https://ftp.lysator.liu.se/pub/archlinux https://ftp.icm.edu.pl/pub/Linux/dist/archlinux https://mirror.telepoint.bg/archlinux https://archlinux.uk.mirror.allworldit.com/archlinux https://mirror.bytemark.co.uk/archlinux https://mirrors.xtom.com/archlinux https://mirrors.mit.edu/archlinux https://mirrors.lug.mtu.edu/archlinux https://mirror.csclub.uwaterloo.ca/archlinux https://mirror.ufscar.br/archlinux https://mirrors.ustc.edu.cn/archlinux https://mirrors.tuna.tsinghua.edu.cn/archlinux https://mirrors.nju.edu.cn/archlinux https://mirrors.bfsu.edu.cn/archlinux https://ftp.jaist.ac.jp/pub/Linux/ArchLinux https://mirror.kakao.com/archlinux https://mirror.aarnet.edu.au/pub/archlinux https://in.mirrors.cicku.me/archlinux https://archlinux.za.mirror.allworldit.com/archlinux https://mirror.f4st.host/archlinux https://mirror.theash.xyz/arch https://mirror.freedif.org/archlinux"
 KMODS_BASE="loop squashfs overlay isofs sr_mod cdrom sd_mod ahci libahci nvme usb_storage uas xhci_pci ehci_pci ohci_pci uhci_hcd virtio_blk virtio_pci virtio_scsi ata_piix ata_generic nls_utf8 nls_cp437"
 REBUILD=0
 FIRMWARE=1
 NVIDIA=1
 GPU=1
 BROADCOM=1
-STACK_PKGS="distrobox podman crun conmon netavark aardvark-dns fuse-overlayfs slirp4netns shadow flatpak bubblewrap xdg-dbus-proxy curl libarchive git"
+STACK_PKGS="distrobox podman crun conmon netavark aardvark-dns fuse-overlayfs slirp4netns passt shadow flatpak bubblewrap xdg-dbus-proxy curl libarchive git"
 DESK_PKGS="dbus seatd pipewire pipewire-pulse pipewire-alsa wireplumber alsa-utils alsa-ucm-conf libinput xkeyboard-config polkit"
 SHELLS=""
 GPU_PKGS="mesa vulkan-icd-loader vulkan-radeon vulkan-intel libdrm nvidia-utils"
@@ -64,11 +64,11 @@ arch_pkg() {
     local p=$1 repo=${2:-core} m idx f pat
     pat=$(printf '%s' "$p" | sed 's/+/\\(+\\|%2B\\)/g')
     for m in $MIRRORS; do
-        idx=$(curl -fsL -m 60 "$m/$repo/os/x86_64/" 2>/dev/null || true)
+        idx=$(curl -fsL --connect-timeout 8 -m 60 "$m/$repo/os/x86_64/" 2>/dev/null || true)
         [ -n "$idx" ] || continue
         f=$(printf '%s\n' "$idx" | grep -o "href=\"$pat-[0-9][^\"]*-x86_64.pkg.tar.zst\"" | sed 's/^href="//;s/"$//' | sort -V | tail -n 1)
         [ -n "$f" ] || continue
-        curl -fsL -m 1800 -o "$WORK/$f" "$m/$repo/os/x86_64/$f" || continue
+        curl -fsL --connect-timeout 8 -m 1800 -o "$WORK/$f" "$m/$repo/os/x86_64/$f" || continue
         printf '%s' "$WORK/$f"
         return 0
     done
@@ -162,20 +162,20 @@ add_glibc_ldconfig() {
 arch_stack() {
     local list=$1
     mkdir -p "$ROOT/Library/pkg/db"
-    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" $list || die "arch-fetch failed for: $list"
+    ARCH_FETCH_MIRRORS="$MIRRORS" ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" $list || die "arch-fetch failed for: $list"
 }
 
 arch_stack_soft() {
     local list=$1
     shift
     mkdir -p "$ROOT/Library/pkg/db"
-    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --soft --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" "$@" || say "warning: arch-fetch failed for part of: $list"
+    ARCH_FETCH_MIRRORS="$MIRRORS" ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --soft --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" "$@" || say "warning: arch-fetch failed for part of: $list"
 }
 
 add_udev() {
     local t=$WORK/hw f
     say "Installing udev from the Arch systemd package"
-    ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --soft --allow systemd --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" systemd || { say "warning: udev could not be installed"; return 0; }
+    ARCH_FETCH_MIRRORS="$MIRRORS" ARCH_FETCH_CACHE="$HERE/cache/arch-fetch" sh "$HERE/arch-fetch" --quiet --soft --allow systemd --record "$ROOT/Library/pkg/db/base.ver" --root "$ROOT" systemd || { say "warning: udev could not be installed"; return 0; }
     for f in systemctl journalctl loginctl machinectl networkctl resolvectl timedatectl hostnamectl localectl busctl coredumpctl bootctl homectl userdbctl portablectl systemd-run systemd-analyze systemd-nspawn systemd-cgls systemd-cgtop systemd-tmpfiles systemd-sysusers systemd-firstboot systemd-repart systemd-sysext systemd-confext systemd-mount systemd-umount systemd-ask-password systemd-tty-ask-password-agent systemd-inhibit systemd-cat systemd-notify systemd-escape systemd-id128 systemd-path systemd-delta systemd-detect-virt systemd-machine-id-setup kernel-install; do
         rm -f "$ROOT/System/bin/$f"
     done
@@ -297,6 +297,17 @@ STORE
     printf '%s:100000:65536\n' "$LIVEUSER" > "$ROOT/private/etc/subuid"
     printf '%s:100000:65536\n' "$LIVEUSER" > "$ROOT/private/etc/subgid"
     chown -R 1000:1000 "$h"
+    mkdir -p "$ROOT/private/etc/containers"
+    cat > "$ROOT/private/etc/containers/containers.conf" <<'CCONF'
+[engine]
+helper_binaries_dir = ["/System/lib/podman", "/System/libexec/podman", "/System/bin"]
+conmon_path = ["/System/bin/conmon"]
+runtime = "crun"
+[engine.runtimes]
+crun = ["/System/bin/crun"]
+[network]
+network_backend = "netavark"
+CCONF
 }
 
 build_ld_cache() {
@@ -526,9 +537,36 @@ if [ -x /System/lib/systemd/systemd-udevd ]; then
     /System/bin/udevadm trigger --action=add 2>/dev/null
     /System/bin/udevadm settle --timeout=15 2>/dev/null
 fi
+rm -f /etc/resolv.conf
+for i in $(busybox ls /sys/class/net); do
+    [ "$i" = lo ] && continue
+    busybox ip link set "$i" up 2>/dev/null
+    busybox udhcpc -b -q -i "$i" -s /System/lib/fasdeqos/udhcpc.script >/dev/null 2>&1
+done
 echo 'fasdeqOS live system'
 RC
     write_services
+    cat > "$ROOT/System/lib/fasdeqos/udhcpc.script" <<'DHCP'
+#!/System/bin/busybox sh
+case $1 in
+    bound|renew)
+        busybox ip addr flush dev "$interface"
+        busybox ip addr add "$ip/${mask:-24}" dev "$interface"
+        for r in $router; do
+            busybox ip route replace default via "$r" dev "$interface"
+            break
+        done
+        : > /private/etc/resolv.conf
+        for d in $dns; do
+            echo "nameserver $d" >> /private/etc/resolv.conf
+        done
+        if [ ! -s /private/etc/resolv.conf ]; then
+            printf 'nameserver 1.1.1.1\nnameserver 8.8.8.8\n' > /private/etc/resolv.conf
+        fi
+        ;;
+esac
+DHCP
+    chmod +x "$ROOT/System/lib/fasdeqos/udhcpc.script"
     cat > "$ROOT/System/bin/fasdeqos-session" <<'SES'
 #!/System/bin/busybox sh
 export PATH=/System/lib/fasdeqos/bin:/System/bin:/bin

@@ -1,14 +1,20 @@
 #!/bin/sh
 set -eu
 
-VERSION=2026.10.09-1
+VERSION=2026.10.10-2
 ROOT=${ARCH_FETCH_ROOT:-}
-MIRRORS=${ARCH_FETCH_MIRRORS:-"https://geo.mirror.pkgbuild.com https://mirrors.kernel.org/archlinux https://mirror.rackspace.com/archlinux"}
+MIRRORS=${ARCH_FETCH_MIRRORS:-"https://geo.mirror.pkgbuild.com https://mirror.rackspace.com/archlinux https://mirrors.kernel.org/archlinux https://mirror.yandex.ru/archlinux https://mirror.truenetwork.ru/archlinux https://ftp.halifax.rwth-aachen.de/archlinux https://mirror.23m.com/archlinux https://mirror.cyberbits.eu/archlinux https://mirror.leaseweb.net/archlinux https://ftp.snt.utwente.nl/pub/linux/archlinux https://mirrors.dotsrc.org/archlinux https://mirror.osbeck.com/archlinux https://ftp.lysator.liu.se/pub/archlinux https://ftp.icm.edu.pl/pub/Linux/dist/archlinux https://mirror.telepoint.bg/archlinux https://archlinux.uk.mirror.allworldit.com/archlinux https://mirror.bytemark.co.uk/archlinux https://mirrors.xtom.com/archlinux https://mirrors.mit.edu/archlinux https://mirrors.lug.mtu.edu/archlinux https://mirror.csclub.uwaterloo.ca/archlinux https://mirror.ufscar.br/archlinux https://mirrors.ustc.edu.cn/archlinux https://mirrors.tuna.tsinghua.edu.cn/archlinux https://mirrors.nju.edu.cn/archlinux https://mirrors.bfsu.edu.cn/archlinux https://ftp.jaist.ac.jp/pub/Linux/ArchLinux https://mirror.kakao.com/archlinux https://mirror.aarnet.edu.au/pub/archlinux https://in.mirrors.cicku.me/archlinux https://archlinux.za.mirror.allworldit.com/archlinux https://mirror.f4st.host/archlinux https://mirror.theash.xyz/arch https://mirror.freedif.org/archlinux"}
 REPOS=${ARCH_FETCH_REPOS:-"core extra"}
 CACHE=${ARCH_FETCH_CACHE:-/private/var/cache/arch-fetch}
 IGNORE=${ARCH_FETCH_IGNORE:-"coreutils findutils grep sed gawk diffutils gzip tar which bash filesystem iana-etc tzdata licenses pacman archlinux-keyring ca-certificates glibc gcc-libs linux-api-headers systemd systemd-sysvcompat udev"}
 DBDIR=${ARCH_FETCH_DBDIR:-}
 QUIET=0
+FORCE=0
+CHECK=0
+LISTFILE=
+RECORD=
+SOFT=0
+MODE=
 
 say() { [ "$QUIET" -eq 1 ] || printf '%s\n' "$*"; }
 die() { printf 'arch-fetch: %s\n' "$*" >&2; exit 1; }
@@ -19,15 +25,23 @@ while [ $# -gt 0 ]; do
         --repos) REPOS=$2; shift ;;
         --quiet|-q) QUIET=1 ;;
         --ignore) IGNORE="$IGNORE $2"; shift ;;
+        --allow) IGNORE=$(printf '%s\n' $IGNORE | grep -vx "$2" | tr '\n' ' '); shift ;;
+        --force) FORCE=1 ;;
+        --check) CHECK=1 ;;
+        --list) LISTFILE=$2; shift ;;
+        --record) RECORD=$2; shift ;;
+        --soft) SOFT=1 ;;
+        --extract) MODE=extract ;;
+        --deps) MODE=deps ;;
         --) shift; break ;;
         -*) die "unknown option: $1" ;;
         *) break ;;
     esac
     shift
 done
-[ $# -gt 0 ] || die "usage: arch-fetch [--root DIR] [--repos 'core extra'] package ..."
+[ $# -gt 0 ] || [ "$CHECK" -eq 1 ] || die "usage: arch-fetch [--root DIR] [--repos 'core extra'] package ..."
 
-for t in curl bsdtar awk sed sort grep; do
+for t in curl bsdtar awk sed sort grep head; do
     command -v "$t" >/dev/null 2>&1 || die "$t is required"
 done
 
@@ -39,13 +53,16 @@ mkdir -p "$CACHE"
 
 pick_mirror() {
     local m
+    if [ -f "$ROOT/private/etc/arch-fetch.mirrors" ]; then
+        MIRRORS="$(cat "$ROOT/private/etc/arch-fetch.mirrors") $MIRRORS"
+    fi
     for m in $MIRRORS; do
-        if curl -fsI -m 30 "$m/core/os/x86_64/core.db" >/dev/null 2>&1; then
+        if curl -fsI --connect-timeout 5 -m 12 "$m/core/os/x86_64/core.db" >/dev/null 2>&1; then
             MIRROR=$m
             return 0
         fi
     done
-    die "no Arch mirror is reachable"
+    die "no Arch mirror is reachable, check the network (ip addr, cat /etc/resolv.conf)"
 }
 
 load_db() {
@@ -72,10 +89,11 @@ load_db() {
                 NF == 0 { next }
                 sec == "%NAME%" { name = $0 }
                 sec == "%FILENAME%" { file = $0 }
+                sec == "%VERSION%" { ver = $0 }
                 sec == "%DEPENDS%" { deps[++nd] = strip($0) }
                 sec == "%PROVIDES%" { prov[++np] = strip($0) }
                 END {
-                    printf "%s\t%s\t%s\n", name, repo, file >> pk
+                    printf "%s\t%s\t%s\t%s\n", name, repo, file, ver >> pk
                     for (i = 1; i <= nd; i++) printf "%s\t%s\n", name, deps[i] >> dp
                     printf "%s\t%s\n", name, name >> pv
                     for (i = 1; i <= np; i++) printf "%s\t%s\n", prov[i], name >> pv
@@ -126,13 +144,20 @@ resolve() {
 }
 
 fetch_one() {
-    local n=$1 repo file url
+    local n=$1 repo file url m got
     repo=$(awk -F'\t' -v n="$n" '$1 == n { print $2; exit }' "$W/pkgs.tsv")
     file=$(awk -F'\t' -v n="$n" '$1 == n { print $3; exit }' "$W/pkgs.tsv")
     [ -n "$file" ] || return 1
     if [ ! -s "$CACHE/$file" ]; then
         url=$(printf '%s' "$file" | sed 's/+/%2B/g')
-        curl -fsL -m 1800 -o "$CACHE/$file.part" "$MIRROR/$repo/os/x86_64/$url" || return 1
+        got=0
+        for m in $MIRROR $MIRRORS; do
+            if curl -fsL --connect-timeout 8 -m 1800 -o "$CACHE/$file.part" "$m/$repo/os/x86_64/$url"; then
+                got=1
+                break
+            fi
+        done
+        [ "$got" -eq 1 ] || return 1
         mv "$CACHE/$file.part" "$CACHE/$file"
     fi
     printf '%s' "$CACHE/$file"
@@ -151,27 +176,91 @@ fix_shebangs() {
     done
 }
 
+put_tree() {
+    local from=$1 to=$2 mode=${3:-}
+    if [ "$FORCE" -eq 1 ] && [ "$mode" != keep ]; then
+        bsdtar -cf - -C "$from" . | bsdtar -xpf - -C "$to"
+    else
+        bsdtar -cf - -C "$from" . | bsdtar -xpkf - -C "$to" 2>/dev/null || true
+    fi
+}
+
+record_one() {
+    local n=$1 v=$2 f=$3
+    mkdir -p "$(dirname "$f")" 2>/dev/null || return 0
+    [ -f "$f" ] && awk -F'\t' -v n="$n" '$1 != n' "$f" > "$f.new" && cat "$f.new" > "$f"
+    rm -f "$f.new"
+    printf '%s\t%s\n' "$n" "$v" >> "$f"
+}
+
+fix_paths() {
+    local src=$1 f
+    for f in "$src"/usr/share/vulkan/*/*.json "$src"/usr/share/glvnd/egl_vendor.d/*.json; do
+        [ -f "$f" ] || continue
+        sed 's|"/usr/lib/|"/System/lib/glibc/|g' "$f" > "$f.new" && cat "$f.new" > "$f"
+        rm -f "$f.new"
+    done
+}
+
 install_tree() {
     local src=$1
     fix_shebangs "$src"
+    fix_paths "$src"
     mkdir -p "$ROOT/System/lib/glibc" "$ROOT/private/etc"
     if [ -d "$src/usr/lib" ]; then
         find "$src/usr/lib" -maxdepth 1 \( -type f -o -type l \) -name '*.so*' -exec cp -af {} "$ROOT/System/lib/glibc/" \; -exec rm -f {} \;
     fi
     if [ -d "$src/usr" ]; then
         mkdir -p "$ROOT/System"
-        cp -an "$src/usr/." "$ROOT/System/"
+        put_tree "$src/usr" "$ROOT/System"
     fi
     if [ -d "$src/etc" ]; then
-        cp -an "$src/etc/." "$ROOT/private/etc/"
+        mkdir -p "$ROOT/private/etc"
+        put_tree "$src/etc" "$ROOT/private/etc" keep
     fi
     if [ -d "$src/opt" ]; then
         mkdir -p "$ROOT/System/opt"
-        cp -an "$src/opt/." "$ROOT/System/opt/"
+        put_tree "$src/opt" "$ROOT/System/opt"
     fi
 }
 
+if [ "$MODE" = deps ]; then
+    for f in "$@"; do
+        bsdtar -xOf "$f" .PKGINFO 2>/dev/null | awk -F' = ' '$1 == "depend" { x = $2; sub(/[<>=].*/, "", x); print x }'
+    done | sort -u
+    exit 0
+fi
+
+if [ "$MODE" = extract ]; then
+    for f in "$@"; do
+        rm -rf "$W/x"
+        mkdir -p "$W/x"
+        bsdtar -xpf "$f" -C "$W/x" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL --exclude ./.CHANGELOG
+        install_tree "$W/x"
+    done
+    exit 0
+fi
+
 load_db
+
+if [ "$CHECK" -eq 1 ]; then
+    [ -n "$LISTFILE" ] && [ -f "$LISTFILE" ] || die "--check needs --list FILE"
+    while IFS="$(printf '\t')" read -r n old; do
+        [ -n "$n" ] || continue
+        new=$(awk -F'\t' -v n="$n" '$1 == n { print $4; exit }' "$W/pkgs.tsv")
+        [ -n "$new" ] || continue
+        [ "$new" = "$old" ] || printf '%s\t%s\t%s\n' "$n" "$old" "$new"
+    done < "$LISTFILE"
+    exit 0
+fi
+
+for a in "$@"; do
+    ignored "$a" && continue
+    if [ -z "$(provider "$a")" ]; then
+        [ "$SOFT" -eq 1 ] && { say "warning: not found in the repositories: $a"; continue; }
+        die "package not found in the repositories: $a"
+    fi
+done
 resolve "$@"
 total=$(wc -l < "$W/want.txt" | tr -d ' ')
 say "$total package(s) to install"
@@ -182,7 +271,8 @@ while IFS= read -r p; do
     mkdir -p "$W/x"
     bsdtar -xpf "$f" -C "$W/x" --exclude ./.PKGINFO --exclude ./.MTREE --exclude ./.BUILDINFO --exclude ./.INSTALL --exclude ./.CHANGELOG
     install_tree "$W/x"
-    printf '%s\n' "$p" >> "$ROOT/private/var/lib/arch-fetch.list" 2>/dev/null || true
+    v=$(awk -F'\t' -v n="$p" '$1 == n { print $4; exit }' "$W/pkgs.tsv")
+    record_one "$p" "$v" "${RECORD:-$ROOT/private/var/lib/arch-fetch.list}"
 done < "$W/want.txt"
 if command -v ldconfig >/dev/null 2>&1 && [ -z "$ROOT" ]; then
     ldconfig 2>/dev/null || true
