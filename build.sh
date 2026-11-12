@@ -31,6 +31,7 @@ if [ "${FASDEQ_INNER:-0}" != 1 ]; then
     echo "Проверка в виртуалке: загрузка с ISO, BIOS или UEFI, вход выполняется сам"
     exit 0
 fi
+
 export DEBIAN_FRONTEND=noninteractive
 W=${FASDEQ_WORK:-/work}
 O=${FASDEQ_OUT:-/out}
@@ -305,6 +306,7 @@ int main(void)
 	return 1;
 }
 EOF_INIT
+
 cat >"$B/kernel.fragment" <<'EOF_KCFG'
 CONFIG_LOCALVERSION="-fasdeqos"
 CONFIG_DEFAULT_HOSTNAME="fasdeq"
@@ -465,6 +467,7 @@ cd "$S/dinit"
     LDFLAGS_EXTRA="-static-libstdc++ -static-libgcc" >"$L/dinit-configure.log" 2>&1
 make -j"$J" >"$L/dinit-make.log" 2>&1
 make install DESTDIR="$R" >"$L/dinit-install.log" 2>&1
+
 say "fish"
 cd "$S/fish"
 CARGO_TARGET_DIR="$B/fish-target" cargo build --release -j"$J" --no-default-features >"$L/fish-build.log" 2>&1
@@ -828,3 +831,576 @@ for d in /sys/bus/pci/devices/*
         set other (math $other + 1)
     end
 end
+
+if test $nv -eq 0
+    echo "nvidia: no NVIDIA GPU, driver not loaded"
+    echo none >/System/run/gpu-mode
+    exit 0
+end
+
+modprobe nvidia
+or begin
+    echo "nvidia: kernel module did not load"
+    exit 1
+end
+modprobe nvidia-uvm
+
+if test $other -eq 0
+    modprobe nvidia-modeset
+    modprobe nvidia-drm modeset=1
+    echo nvidia-primary >/System/run/gpu-mode
+else
+    echo nvidia-offload >/System/run/gpu-mode
+end
+
+test -e /dev/nvidiactl; or mknod -m 666 /dev/nvidiactl c 195 255
+test -e /dev/nvidia-modeset; or mknod -m 666 /dev/nvidia-modeset c 195 254
+set -l n 0
+for gpu in /proc/driver/nvidia/gpus/*
+    test -e /dev/nvidia$n; or mknod -m 666 /dev/nvidia$n c 195 $n
+    set n (math $n + 1)
+end
+set -l uvm (string match -r '^\s*(\d+)\s+nvidia-uvm$' (cat /proc/devices) | tail -n 1)
+if test -n "$uvm"
+    test -e /dev/nvidia-uvm; or mknod -m 666 /dev/nvidia-uvm c $uvm 0
+    test -e /dev/nvidia-uvm-tools; or mknod -m 666 /dev/nvidia-uvm-tools c $uvm 1
+end
+echo "nvidia: ready, mode "(cat /System/run/gpu-mode)
+EOF
+cat >"$OV/System/libexec/fasdeqos/nvidia-unload.fish" <<'EOF'
+#!/System/bin/fish
+set -x PATH /System/bin /System/sbin /System/Applications/Chimerautils.app/Contents/MacOS
+for m in nvidia-uvm nvidia-drm nvidia-modeset nvidia
+    rmmod $m 2>/dev/null
+end
+exit 0
+EOF
+cat >"$OV/System/libexec/fasdeqos/network.fish" <<'EOF'
+#!/System/bin/fish
+set -x PATH /System/bin /System/sbin /System/Applications/Chimerautils.app/Contents/MacOS
+for i in (ls /sys/class/net)
+    test $i = lo; and continue
+    busybox ifconfig $i up
+    busybox udhcpc -q -n -t 3 -T 1 -i $i -s /System/libexec/fasdeqos/udhcpc.script
+end
+busybox ifconfig lo 127.0.0.1 up
+exit 0
+EOF
+cat >"$OV/System/libexec/fasdeqos/udhcpc.script" <<'EOF'
+#!/System/bin/fish
+switch "$argv[1]"
+    case bound renew
+        busybox ifconfig $interface $ip netmask $subnet
+        if test -n "$router"
+            busybox route add default gw (string split ' ' -- $router)[1] dev $interface
+        end
+        if test -n "$dns"
+            for ns in (string split ' ' -- $dns)
+                echo nameserver $ns
+            end >/System/etc/resolv.conf
+        end
+end
+exit 0
+EOF
+cat >"$OV/System/bin/nvrun" <<'EOF'
+#!/System/bin/fish
+set -gx LD_LIBRARY_PATH /System/Library/Frameworks/NVIDIA.framework/lib
+set -gx __NV_PRIME_RENDER_OFFLOAD 1
+set -gx __GLX_VENDOR_LIBRARY_NAME nvidia
+set -gx __EGL_VENDOR_LIBRARY_FILENAMES /System/Library/Frameworks/NVIDIA.framework/share/glvnd/egl_vendor.d/10_nvidia.json
+set -gx VK_ICD_FILENAMES /System/Library/Frameworks/NVIDIA.framework/share/vulkan/icd.d/nvidia_icd.json
+exec $argv
+EOF
+
+cat >"$OV/System/bin/pkg" <<'EOF'
+#!/System/bin/fish
+set -g APPS /Applications
+set -g DB /Applications/.pkgdb
+set -g FLATHUB https://dl.flathub.org/repo/flathub.flatpakrepo
+set -g BREWBIN /home/linuxbrew/.linuxbrew/bin
+set -g PKGVER 1.0
+
+function die
+    echo "pkg: $argv" >&2
+    exit 1
+end
+
+function mget
+    set -l v (string match -rg '^'$argv[2]':\s*(.*)$' < $argv[1])
+    echo $v[1]
+end
+
+function appdir
+    set -l d $APPS/$argv[1].app
+    if test -d $d
+        set -l cur (cat $d/Contents/Version 2>/dev/null)
+        if test "$cur" != "$argv[2]"
+            set d "$APPS/$argv[1] $argv[2].app"
+        end
+    end
+    echo $d
+end
+
+function register
+    mkdir -p $DB
+    set -l base (basename $argv[1] .app)
+    cp $argv[1]/Contents/+MANIFEST "$DB/$base"
+    echo "dir: $argv[1]" >>"$DB/$base"
+end
+
+function mkapp
+    set -l d $argv[1]
+    set -l name $argv[2]
+    set -l ver $argv[3]
+    set -l type $argv[4]
+    set -l ref $argv[5]
+    set -l ex $argv[6]
+    set -l comment $argv[7]
+    set -l icon $argv[8]
+    set -l tmp "$APPS/.$name.part"
+    rm -rf $tmp
+    mkdir -p $tmp/Contents/MacOS $tmp/Contents/Resources
+    echo $ver >$tmp/Contents/Version
+    printf 'name: %s\nversion: %s\ntype: %s\nref: %s\nexec: %s\ncomment: %s\n' $name $ver $type $ref $ex $comment >$tmp/Contents/+MANIFEST
+    printf '<?xml version="1.0" encoding="UTF-8"?>\n<plist version="1.0"><dict>\n<key>CFBundleName</key><string>%s</string>\n<key>CFBundleVersion</key><string>%s</string>\n<key>CFBundleExecutable</key><string>launcher</string>\n</dict></plist>\n' $name $ver >$tmp/Contents/Info.plist
+    set -l l $tmp/Contents/MacOS/launcher
+    echo '#!/System/bin/fish' >$l
+    switch $type
+        case flatpak
+            echo 'exec flatpak run '$ref' $argv' >>$l
+        case brew
+            echo 'exec '$BREWBIN'/'$ex' $argv' >>$l
+        case container
+            echo 'exec distrobox-enter -n '$name' -- '$ex' $argv' >>$l
+    end
+    chmod 755 $l
+    test -n "$icon"; and test -f "$icon"; and cp $icon $tmp/Contents/Resources/icon.png
+    rm -rf $d
+    mv $tmp $d
+    register $d
+end
+
+function add_pkg
+    set -l f $argv[1]
+    test -f "$f"; or die "$f: no such file"
+    set -l t (mktemp -d)
+    tar -xf "$f" -C $t 2>/dev/null; or begin
+        rm -rf $t
+        die "$f: not a valid package"
+    end
+    set -l m $t/+MANIFEST
+    test -f $m; or begin
+        rm -rf $t
+        die "$f: +MANIFEST missing"
+    end
+    set -l name (mget $m name)
+    set -l ver (mget $m version)
+    set -l type (mget $m type)
+    set -l ref (mget $m ref)
+    set -l ex (mget $m exec)
+    set -l comment (mget $m comment)
+    set -l setup (mget $m setup)
+    test -n "$name"; or begin
+        rm -rf $t
+        die "manifest has no name"
+    end
+    test -n "$ver"; or set ver 1
+    set -l d (appdir $name $ver)
+    switch $type
+        case bundle
+            set -l a (ls -d $t/payload/*.app 2>/dev/null)[1]
+            test -n "$a"; or begin
+                rm -rf $t
+                die "bundle package has no payload/*.app"
+            end
+            set -l tmp "$APPS/.$name.part"
+            rm -rf $tmp
+            cp -R $a $tmp
+            mkdir -p $tmp/Contents
+            echo $ver >$tmp/Contents/Version
+            cp $m $tmp/Contents/+MANIFEST
+            rm -rf $d
+            mv $tmp $d
+            register $d
+        case flatpak
+            flatpak remote-add --user --if-not-exists flathub $FLATHUB; or begin
+                rm -rf $t
+                die "cannot add flathub"
+            end
+            flatpak install --user -y --noninteractive flathub $ref; or begin
+                rm -rf $t
+                die "flatpak install failed: $ref"
+            end
+            mkapp $d $name $ver flatpak $ref $ex $comment $t/icon.png
+        case brew
+            $BREWBIN/brew install $ref; or begin
+                rm -rf $t
+                die "brew install failed: $ref"
+            end
+            test -n "$ex"; or set ex $ref
+            mkapp $d $name $ver brew $ref $ex $comment $t/icon.png
+        case container
+            distrobox create --yes --name $name --image $ref; or begin
+                rm -rf $t
+                die "distrobox create failed: $ref"
+            end
+            test -n "$setup"; and distrobox-enter -n $name -- sh -c "$setup"
+            mkapp $d $name $ver container $ref $ex $comment $t/icon.png
+        case '*'
+            rm -rf $t
+            die "unknown package type: $type"
+    end
+    rm -rf $t
+    echo "installed: $d"
+end
+
+function create_pkg
+    set -l spec $argv[1]
+    set -l outdir .
+    set -l name ''
+    set -l ver ''
+    set -l i 2
+    while test $i -le (count $argv)
+        switch $argv[$i]
+            case -o
+                set i (math $i + 1)
+                set outdir $argv[$i]
+            case -n
+                set i (math $i + 1)
+                set name $argv[$i]
+            case -v
+                set i (math $i + 1)
+                set ver $argv[$i]
+        end
+        set i (math $i + 1)
+    end
+    set -l type (string split -m1 : -- $spec)[1]
+    set -l ref (string split -m1 : -- $spec)[2]
+    test -n "$ref"; or die "usage: pkg create flathub:APP.ID | brew:FORMULA | container:IMAGE | bundle:/path/Name.app"
+    test -n "$ver"; or set ver 1
+    set -l t (mktemp -d)
+    switch $type
+        case flathub flatpak
+            set type flatpak
+            test -n "$name"; or set name (string split . -- $ref)[-1]
+        case brew
+            test -n "$name"; or set name $ref
+        case container
+            test -n "$name"; or set name (string replace -ra '[^A-Za-z0-9]' '-' -- $ref)
+        case bundle
+            test -n "$name"; or set name (basename $ref .app)
+            mkdir -p $t/payload
+            cp -R $ref $t/payload/
+        case '*'
+            rm -rf $t
+            die "unknown source: $type"
+    end
+    printf 'name: %s\nversion: %s\ntype: %s\nref: %s\nexec: %s\ncomment: %s\n' $name $ver $type $ref $ref $name >$t/+MANIFEST
+    set -l out "$outdir/$name-$ver.pkg"
+    tar --zstd -cf "$out" -C $t +MANIFEST (ls $t | string match -v '+MANIFEST')
+    rm -rf $t
+    echo "created: $out"
+end
+
+function remove_pkg
+    for n in $argv
+        set -l e "$DB/$n"
+        test -f "$e"; or begin
+            echo "pkg: $n: not installed" >&2
+            continue
+        end
+        set -l type (mget $e type)
+        set -l ref (mget $e ref)
+        set -l dir (mget $e dir)
+        switch $type
+            case flatpak
+                flatpak uninstall --user -y $ref
+            case brew
+                $BREWBIN/brew uninstall $ref
+            case container
+                distrobox rm --force $n
+        end
+        rm -rf "$dir"
+        rm -f "$e"
+        echo "removed: $n"
+    end
+end
+
+function list_pkg
+    for e in $DB/*
+        test -f "$e"; or continue
+        echo (basename "$e")"-"(mget $e version)" ["(mget $e type)"]"
+    end
+end
+
+function resolve_install
+    set -l a $argv[1]
+    if string match -q '*.pkg' -- $a
+        add_pkg $a
+    else if string match -q '*:*' -- $a
+        set -l t (mktemp -d)
+        set -l out (create_pkg $a -o $t | string replace 'created: ' '')
+        add_pkg $out
+        rm -rf $t
+    else if string match -q '*.*.*' -- $a
+        resolve_install flathub:$a
+    else
+        resolve_install brew:$a
+    end
+end
+
+if test (count $argv) -eq 0
+    echo "usage: pkg add|install|delete|remove|info|search|update|upgrade|create|autoremove|version"
+    exit 1
+end
+
+set -l cmd $argv[1]
+set -e argv[1]
+
+switch $cmd
+    case add
+        for a in $argv
+            add_pkg $a
+        end
+    case install
+        for a in $argv
+            resolve_install $a
+        end
+    case delete remove
+        remove_pkg $argv
+    case info
+        if test (count $argv) -eq 0
+            list_pkg
+        else
+            for n in $argv
+                test -f "$DB/$n"; and cat "$DB/$n"; or echo "pkg: $n: not installed" >&2
+            end
+        end
+    case list
+        list_pkg
+    case search
+        flatpak remote-add --user --if-not-exists flathub $FLATHUB 2>/dev/null
+        flatpak search --user $argv 2>/dev/null
+        $BREWBIN/brew search $argv 2>/dev/null
+    case update
+        flatpak update --user -y --appstream 2>/dev/null
+        $BREWBIN/brew update 2>/dev/null
+    case upgrade
+        flatpak update --user -y 2>/dev/null
+        $BREWBIN/brew upgrade 2>/dev/null
+    case create
+        create_pkg $argv
+    case autoremove
+        flatpak uninstall --user --unused -y 2>/dev/null
+        $BREWBIN/brew autoremove 2>/dev/null
+    case version -v --version
+        echo $PKGVER
+    case '*'
+        die "unknown command: $cmd"
+end
+EOF
+cat >"$OV/System/bin/pkgd" <<'EOF'
+#!/System/bin/fish
+set -x PATH /System/bin /System/sbin /System/Applications/Chimerautils.app/Contents/MacOS /home/linuxbrew/.linuxbrew/bin
+
+function handle
+    set -l p /Applications/$argv[1]
+    sleep 0.2
+    if pkg add $p >>$HOME/.pkgd.log 2>&1
+        rm -f $p
+    end
+end
+
+for f in /Applications/*.pkg
+    test -f $f; and handle (basename $f)
+end
+
+inotifywait -m -q -e close_write -e moved_to --format '%f' /Applications | while read -l f
+    string match -q '*.pkg' -- $f; and handle $f
+end
+EOF
+chmod 755 "$OV"/System/bin/pkg "$OV"/System/bin/pkgd "$OV"/System/bin/nvrun "$OV"/System/libexec/fasdeqos/*
+
+cat >"$B/selftest.fish" <<'EOF'
+#!/System/bin/fish
+echo "=== SELFTEST BEGIN ==="
+echo "user: "(id -un)" uid "(id -u)
+echo "home: $HOME"; ls -ld /Users/live
+echo "--- root"; ls /
+echo "--- /System"; ls /System
+echo "--- /System/Applications"; ls /System/Applications
+echo "--- symlinks"; find /System /Applications /home -xdev -type l | wc -l
+echo "--- mounts"; cat /proc/mounts | grep -E "btrfs|tmpfs|overlay|iso9660"
+echo "--- tools"
+for t in tar zstd git curl flatpak bwrap busybox inotifywait fastfetch pkg brew sh env fish
+    command -q $t; and echo "  ok   $t"; or echo "  MISS $t"
+end
+echo "--- bash only for brew"; ls /System/Library/Homebrew/bin
+echo "--- homebrew tree"; ls /home/linuxbrew/.linuxbrew
+echo "--- passwd lookup"; id live; getent passwd live
+echo "--- network"; busybox ifconfig -a 2>&1 | grep -E "^[a-z]|inet addr"; cat /System/etc/resolv.conf; cat /System/var/log/network.log; busybox route -n
+echo "--- binaries run"; git --version; curl --version | head -1; flatpak --version; brew --version; tar --version
+echo "--- curl https"; curl -sS -m 8 -o /dev/null -w "%{http_code}\n" https://example.com 2>&1
+echo "--- gpu mode"; cat /System/run/gpu-mode
+echo "--- nvidia log"; cat /System/var/log/nvidia.log
+echo "--- fastfetch"; fastfetch --pipe 2>&1 | head -12
+echo "--- pkg drag-and-drop"
+mkdir -p /System/tmp/t/Hello.app/Contents/MacOS
+printf '#!/System/bin/fish\necho hello\n' >/System/tmp/t/Hello.app/Contents/MacOS/launcher
+chmod 755 /System/tmp/t/Hello.app/Contents/MacOS/launcher
+pkg create bundle:/System/tmp/t/Hello.app -o /System/tmp/t -v 1.0
+pkg create bundle:/System/tmp/t/Hello.app -o /System/tmp/t -v 2.0
+cp /System/tmp/t/Hello-1.0.pkg /Applications/
+set -l t0 (date +%s)
+for i in (seq 1 40)
+    test -d /Applications/Hello.app; and break
+    sleep 0.25
+end
+test -d /Applications/Hello.app; and echo "SHORTCUT-OK after "(math (date +%s) - $t0)"s"; or echo "SHORTCUT-FAIL"
+cp /System/tmp/t/Hello-2.0.pkg /Applications/
+for i in (seq 1 40)
+    test -d "/Applications/Hello 2.0.app"; and break
+    sleep 0.25
+end
+test -d "/Applications/Hello 2.0.app"; and echo "VERSIONED-OK"; or echo "VERSIONED-FAIL"
+ls -A /Applications
+echo "--- pkg info"; pkg info
+echo "--- run launcher"; /Applications/Hello.app/Contents/MacOS/launcher
+echo "--- pkg delete"; pkg delete Hello "Hello 2.0"; ls -A /Applications
+echo "=== SELFTEST END ==="
+EOF
+
+say "сборка образа"
+rm -rf "$B/iso" "$B/mnt"
+mkdir -p "$B/iso/FasdeqOS" "$B/iso/boot/grub" "$B/mnt" "$O"
+ISO=$O/FasdeqOS-0.2-x86_64${SELFTEST:+-selftest}.iso
+IMG=$B/iso/FasdeqOS/container.btrfs
+MNT=$B/mnt
+cleanup_mnt() { mountpoint -q "$MNT" && umount "$MNT" || true; }
+trap cleanup_mnt EXIT
+
+TOTAL=$(du -sm "$R/System" "$B/hb" "$B/overlay" | awk '{s+=$1} END {print s}')
+SIZE_MB=$(( TOTAL * 110 / 100 + 512 ))
+truncate -s "${SIZE_MB}M" "$IMG"
+mkfs.btrfs -q -f -L FasdeqOS -m single -d single --nodesize 16384 -O no-holes,free-space-tree "$IMG"
+mount -o loop,compress-force=${COMP:-zstd:1},noatime "$IMG" "$MNT"
+btrfs subvolume create "$MNT/@system" >/dev/null
+btrfs subvolume create "$MNT/@homebrew" >/dev/null
+cp -a "$R/System/." "$MNT/@system/"
+cp -a "$B/hb/." "$MNT/@homebrew/"
+cp -a "$OV/System/." "$MNT/@system/"
+mkdir -p "$MNT/@system/run" "$MNT/@system/tmp" "$MNT/@system/var"
+chown -R 1000:1000 "$MNT/@homebrew/linuxbrew"
+
+say "модули ядра"
+make -C "$S/linux" modules_install MODLIB="$MNT/@system/Library/Extensions/$KVER" INSTALL_MOD_STRIP=1 DEPMOD=true >"$L/modules-install.log" 2>&1
+rm -f "$MNT/@system/Library/Extensions/$KVER/build" "$MNT/@system/Library/Extensions/$KVER/source"
+mkdir -p "$MNT/@system/Library/Extensions/$KVER/extra"
+cp "$B"/nvidia-modules/*.ko "$MNT/@system/Library/Extensions/$KVER/extra/"
+"$R/System/sbin/depmod" -a -b "$MNT/@system" --moduledir Library/Extensions "$KVER" 2>>"$L/depmod.log" || \
+    depmod -a -b "$MNT/@system/Library/Extensions" "$KVER" 2>>"$L/depmod.log" || true
+
+say "библиотеки и пути для всех бинарников"
+ELFDIRS=("$MNT/@system/bin" "$MNT/@system/sbin" "$MNT/@system/libexec")
+for dir in "${ELFDIRS[@]}"; do
+    find "$dir" -type f 2>/dev/null | while read -r f; do
+        is_elf "$f" || continue
+        case "$(basename "$f")" in ldconfig|sln|iconvconfig|ld.so|busybox) continue ;; esac
+        patchelf --print-interpreter "$f" >/dev/null 2>&1 || continue
+        collect_libs "$f" "$MNT/@system/lib"
+        patch_exec "$f" '/System/lib'
+    done
+done
+for f in "$MNT/@system/Library/Homebrew/bin/bash"; do
+    [ -f "$f" ] || continue
+    collect_libs "$f" "$MNT/@system/lib"
+    patch_exec "$f" '/System/lib'
+done
+for f in "$MNT"/@system/lib/*.so*; do
+    [ -L "$f" ] && continue
+    case "$(basename "$f")" in ld-linux*|libc.so.6|libm.so.6) continue ;; esac
+    patchelf --set-rpath '/System/lib' "$f" 2>/dev/null || true
+done
+mount --bind "$MNT/@system" "$R/System"
+"$R/System/sbin/ldconfig" -X -r "$R" 2>>"$L/ldconfig.log" || true
+umount "$R/System"
+
+say "лицензия"
+install -D -m644 "$S/linux/COPYING" "$MNT/@system/share/licenses/FasdeqOS/GPL-2.0.txt"
+cat >"$MNT/@system/share/licenses/FasdeqOS/README" <<'EOF_LIC'
+FasdeqOS - author: fasdeq13 - licensed under the GNU General Public License v2.0.
+Components keep their own licenses.
+NVIDIA userland and AMD firmware are proprietary redistributable binaries.
+EOF_LIC
+cp "$MNT/@system/share/licenses/FasdeqOS/GPL-2.0.txt" "$B/iso/LICENSE"
+
+if [ -n "${SELFTEST:-}" ]; then
+    install -m755 "$B/selftest.fish" "$MNT/@system/libexec/fasdeqos/selftest.fish"
+    printf 'type = process\ncommand = /System/bin/fish /System/libexec/fasdeqos/selftest.fish\nrun-as = live\noptions = runs-on-console\nenv-file = /System/etc/dinit.d/env.live\nrestart = false\n' >"$MNT/@system/etc/dinit.d/session"
+fi
+
+say "ни одного симлинка: заменяю клонами"
+flatten() {
+    local root=$1 link tgt dir abs
+    while IFS= read -r -d '' link; do
+        tgt=$(readlink "$link")
+        dir=$(dirname "$link")
+        case "$tgt" in
+            /System/*) abs="$MNT/@system/${tgt#/System/}" ;;
+            /home/*)   abs="$MNT/@homebrew/${tgt#/home/}" ;;
+            /*)        abs="$tgt" ;;
+            *)         abs="$dir/$tgt" ;;
+        esac
+        abs=$(realpath -m "$abs")
+        rm "$link"
+        if [ -e "$abs" ]; then
+            if [ -d "$abs" ]; then cp -a --reflink=always "$abs" "$link"; else cp --reflink=always "$abs" "$link"; fi
+        fi
+    done < <(find "$root" -type l -print0)
+}
+for pass in 1 2 3; do flatten "$MNT/@system"; flatten "$MNT/@homebrew"; done
+LEFT=$(find "$MNT/@system" "$MNT/@homebrew" -type l | wc -l)
+echo "   симлинков осталось: $LEFT"
+[ "$LEFT" -eq 0 ]
+
+mkdir -p "$MNT/.snapshots"
+btrfs subvolume snapshot -r "$MNT/@system" "$MNT/.snapshots/system-0.2" >/dev/null
+
+say "сжатие образа"
+sync
+btrfs balance start -d -m "$MNT" >/dev/null 2>&1 || true
+sync
+ALLOC=$(btrfs filesystem usage -b "$MNT" | awk '/Device allocated:/ {print $3; exit}')
+NEW=$(( ALLOC / 1048576 + 128 ))
+SHRUNK=0
+if btrfs filesystem resize "1:${NEW}M" "$MNT" >/dev/null 2>&1; then SHRUNK=1; fi
+sync
+umount "$MNT"
+[ "$SHRUNK" = 1 ] && truncate -s "${NEW}M" "$IMG"
+ls -la "$IMG" | awk '{printf "контейнер: %.0f МБ\n", $5/1048576}'
+
+say "initramfs, ядро, загрузчик"
+gcc -O2 -static -Wall -o "$B/init" "$B/init.c"
+rm -rf "$B/initrd"
+mkdir -p "$B/initrd/dev" "$B/initrd/proc" "$B/initrd/sys"
+install -m755 "$B/init" "$B/initrd/init"
+( cd "$B/initrd" && find . | cpio -o -H newc --quiet | zstd -19 -q -o "$B/iso/boot/initramfs.zst" )
+install -m644 "$S/linux/arch/x86/boot/bzImage" "$B/iso/boot/vmlinuz"
+cat >"$B/iso/boot/grub/grub.cfg" <<'EOF_GRUB'
+set timeout=2
+set default=0
+menuentry "FasdeqOS" {
+    linux /boot/vmlinuz console=tty0 console=ttyS0,115200 quiet loglevel=3 firmware_class.path=/System/Library/Firmware modprobe.blacklist=nouveau
+    initrd /boot/initramfs.zst
+}
+menuentry "FasdeqOS (verbose)" {
+    linux /boot/vmlinuz console=tty0 console=ttyS0,115200 loglevel=7 firmware_class.path=/System/Library/Firmware
+    initrd /boot/initramfs.zst
+}
+EOF_GRUB
+rm -f "$ISO"
+grub-mkrescue -o "$ISO" "$B/iso" -volid FASDEQOS >"$L/grub-mkrescue.log" 2>&1
+ls -la "$ISO" | awk '{printf "ISO: %.0f МБ  %s\n", $5/1048576, $9}'
+( cd "$O" && sha256sum "$(basename "$ISO")" | tee "$(basename "$ISO").sha256" )
+rm -f /System
+rm -rf /home/linuxbrew
