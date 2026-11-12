@@ -465,3 +465,366 @@ cd "$S/dinit"
     LDFLAGS_EXTRA="-static-libstdc++ -static-libgcc" >"$L/dinit-configure.log" 2>&1
 make -j"$J" >"$L/dinit-make.log" 2>&1
 make install DESTDIR="$R" >"$L/dinit-install.log" 2>&1
+say "fish"
+cd "$S/fish"
+CARGO_TARGET_DIR="$B/fish-target" cargo build --release -j"$J" --no-default-features >"$L/fish-build.log" 2>&1
+for t in fish fish_indent fish_key_reader; do
+    install -D -m755 "$B/fish-target/release/$t" "$R/System/bin/$t"
+done
+mkdir -p "$R/System/share/fish"
+for d in functions completions tools; do cp -a "$S/fish/share/$d" "$R/System/share/fish/"; done
+cp "$S/fish/share/config.fish" "$R/System/share/fish/"
+
+say "fastfetch $FF_TAG"
+cmake -S "$S/fastfetch" -B "$B/fastfetch-build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/System -DBUILD_FLASHFETCH=OFF >"$L/fastfetch-cmake.log" 2>&1
+ninja -C "$B/fastfetch-build" >"$L/fastfetch-ninja.log" 2>&1
+DESTDIR="$R" ninja -C "$B/fastfetch-build" install >"$L/fastfetch-install.log" 2>&1
+
+say "chimerautils"
+sed -i "/^    subdir('telnet')/d" "$S/chimerautils/src.freebsd/meson.build"
+if [ ! -d "$B/chimera-build" ]; then
+    PKG_CONFIG_PATH="$R/System/lib/pkgconfig" CFLAGS="-I$R/System/include" LDFLAGS="-L$R/System/lib" \
+    meson setup "$B/chimera-build" "$S/chimerautils" --prefix=/System --bindir=/System/bin \
+        --sbindir=/System/sbin --libdir=/System/lib --sysconfdir=/System/etc \
+        -Dopenssl=disabled -Dlibedit=disabled -Dpam=disabled -Dselinux=disabled -Dtiny=disabled \
+        >"$L/chimera-setup.log" 2>&1
+fi
+ninja -C "$B/chimera-build" >"$L/chimera-ninja.log" 2>&1
+rm -rf "$B/stage-chimera"
+DESTDIR="$B/stage-chimera" ninja -C "$B/chimera-build" install >"$L/chimera-install.log" 2>&1
+
+say "ядро Linux 6.12"
+cd "$S/linux"
+[ -f .config ] || make defconfig >"$L/kernel-defconfig.log" 2>&1
+scripts/kconfig/merge_config.sh -m .config "$B/kernel.fragment" >"$L/kernel-merge.log" 2>&1
+make olddefconfig >"$L/kernel-olddefconfig.log" 2>&1
+make -j"$J" bzImage modules >"$L/kernel-build.log" 2>&1
+KVER=$(cat include/config/kernel.release)
+
+say "модули NVIDIA open $NV_VER"
+cd "$S/nvidia"
+make -j"$J" modules SYSSRC="$S/linux" SYSOUT="$S/linux" IGNORE_CC_MISMATCH=1 >"$L/nvidia-modules.log" 2>&1
+mkdir -p "$B/nvidia-modules"
+cp kernel-open/nvidia.ko kernel-open/nvidia-uvm.ko kernel-open/nvidia-drm.ko kernel-open/nvidia-modeset.ko "$B/nvidia-modules/"
+strip --strip-debug "$B"/nvidia-modules/*.ko
+
+say "пакеты NVIDIA userland и прошивки"
+mkdir -p "$B/debs"
+cd "$B/debs"
+NVMAJ=${NV_VER%%.*}
+ls ./*.deb >/dev/null 2>&1 || apt-get download \
+    libnvidia-gl-$NVMAJ libnvidia-compute-$NVMAJ libnvidia-extra-$NVMAJ libnvidia-decode-$NVMAJ \
+    libnvidia-encode-$NVMAJ nvidia-utils-$NVMAJ nvidia-firmware-$NVMAJ-$NV_VER linux-firmware >"$L/debs.log" 2>&1
+rm -rf "$B/nv" "$B/fw"
+mkdir -p "$B/nv" "$B/fw"
+for d in "$B"/debs/*nvidia*.deb; do dpkg-deb -x "$d" "$B/nv"; done
+dpkg-deb -x "$B"/debs/linux-firmware*.deb "$B/fw"
+
+say "Homebrew"
+rm -rf /home/linuxbrew
+mkdir -p /home/linuxbrew/.linuxbrew
+cp -a "$S/brew" /home/linuxbrew/.linuxbrew/Homebrew
+for d in bin etc include lib opt sbin share var Cellar; do mkdir -p /home/linuxbrew/.linuxbrew/$d; done
+(
+    cd /home/linuxbrew/.linuxbrew/Homebrew
+    HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_ANALYTICS=1 HOMEBREW_PREFIX=/home/linuxbrew/.linuxbrew \
+        ./bin/brew vendor-install ruby >"$L/brew-vendor.log" 2>&1
+) || echo "   (portable ruby для brew не скачан, brew докачает при первом запуске)"
+grep -rIl -e '/bin/bash' -e '/usr/bin/env' /home/linuxbrew/.linuxbrew/Homebrew --exclude-dir=.git --exclude-dir=vendor 2>/dev/null |
+    xargs -r sed -i -e 's|/usr/bin/env bash|/System/Library/Homebrew/bin/bash|g' -e 's|/bin/bash|/System/Library/Homebrew/bin/bash|g' -e 's|/usr/bin/env|/System/bin/env|g'
+cat >/home/linuxbrew/.linuxbrew/bin/brew <<'EOF_BREW'
+#!/System/Library/Homebrew/bin/bash
+exec /System/Library/Homebrew/bin/bash /home/linuxbrew/.linuxbrew/Homebrew/bin/brew "$@"
+EOF_BREW
+chmod 755 /home/linuxbrew/.linuxbrew/bin/brew
+rm -rf "$B/hb"
+mkdir -p "$B/hb"
+cp -a /home/linuxbrew "$B/hb/"
+
+glibc_soname() {
+    case "$1" in
+        linux-vdso.so.1|ld-linux-x86-64.so.2|libc.so.6|libm.so.6|libdl.so.2|libpthread.so.0|librt.so.1|\
+        libutil.so.1|libresolv.so.2|libnsl.so.1|libanl.so.1|libmvec.so.1|libBrokenLocale.so.1|\
+        libthread_db.so.1|libnss_*|libSegFault.so) return 0 ;;
+    esac
+    return 1
+}
+is_elf() { [ "$(od -An -tx1 -N4 "$1" 2>/dev/null | tr -d ' \n')" = "7f454c46" ]; }
+collect_libs() {
+    local elf=$1 dest=$2 line name path
+    mkdir -p "$dest"
+    while read -r line; do
+        case "$line" in *"=>"*) ;; *) continue ;; esac
+        name=${line%% *}
+        name=${name##*/}
+        path=${line#*=> }
+        path=${path%% *}
+        glibc_soname "$name" && continue
+        [ -f "$path" ] || continue
+        case "$path" in /System/*|"$R"/*) continue ;; esac
+        if [ ! -e "$dest/$name" ]; then
+            cp -L "$path" "$dest/$name"
+            collect_libs "$dest/$name" "$dest"
+        fi
+    done < <(ldd "$elf" 2>/dev/null || true)
+}
+patch_exec() { patchelf --set-interpreter "$LOADER" --set-rpath "$2" "$1" 2>/dev/null || true; }
+
+say "системные инструменты из Ubuntu (бинарники, без сборки)"
+IMPORT=$B/import
+rm -rf "$IMPORT"
+mkdir -p "$IMPORT"
+imp() { [ -x "$1" ] && install -D -m755 "$1" "$2" || echo "   нет $1"; }
+imp /usr/bin/bsdtar "$R/System/bin/tar"
+imp /usr/bin/zstd "$R/System/bin/zstd"
+imp /usr/bin/inotifywait "$R/System/bin/inotifywait"
+imp /usr/bin/git "$R/System/bin/git"
+imp /usr/bin/curl "$R/System/bin/curl"
+imp /usr/bin/flatpak "$R/System/bin/flatpak"
+imp /usr/bin/bwrap "$R/System/bin/bwrap"
+imp /usr/bin/xdg-dbus-proxy "$R/System/bin/xdg-dbus-proxy"
+imp /usr/bin/busybox "$R/System/bin/busybox"
+imp /usr/bin/bash "$R/System/Library/Homebrew/bin/bash"
+for h in git-remote-http git-remote-https git-http-fetch; do imp /usr/lib/git-core/$h "$R/System/libexec/git-core/$h"; done
+mkdir -p "$R/System/share/git-core"
+cp -a /usr/share/git-core/templates "$R/System/share/git-core/" 2>/dev/null || true
+mkdir -p "$R/System/etc/ssl/certs"
+cp -L /etc/ssl/certs/ca-certificates.crt "$R/System/etc/ssl/certs/ca-certificates.crt"
+mkdir -p "$R/System/share/flatpak" "$R/System/etc/flatpak"
+cp -a /usr/share/flatpak/. "$R/System/share/flatpak/" 2>/dev/null || true
+
+say "chimerautils -> /System/Applications/Chimerautils.app"
+APP=$R/System/Applications/Chimerautils.app/Contents
+mkdir -p "$APP/MacOS" "$APP/Frameworks" "$APP/Resources"
+cp -a "$B/stage-chimera/System/bin/." "$APP/MacOS/"
+[ -d "$B/stage-chimera/System/sbin" ] && cp -a "$B/stage-chimera/System/sbin/." "$APP/MacOS/"
+[ -d "$B/stage-chimera/System/share/man" ] && cp -a "$B/stage-chimera/System/share/man" "$APP/Resources/man"
+cp -L "$R/System/lib/libxo.so.0" "$APP/Frameworks/libxo.so.0"
+for l in "$B"/stage-chimera/System/lib/lib*.so*; do [ -e "$l" ] && cp -a "$l" "$APP/Frameworks/"; done
+cat >"$APP/Info.plist" <<'EOF_PLIST'
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>Chimerautils</string>
+<key>CFBundleIdentifier</key><string>org.fasdeqos.chimerautils</string>
+<key>CFBundleVersion</key><string>1</string>
+</dict></plist>
+EOF_PLIST
+find "$APP/MacOS" -type f | while read -r f; do
+    if is_elf "$f"; then
+        collect_libs "$f" "$APP/Frameworks"
+        patch_exec "$f" '$ORIGIN/../Frameworks'
+    fi
+done
+for f in "$APP"/Frameworks/*.so*; do
+    [ -L "$f" ] && continue
+    patchelf --set-rpath '$ORIGIN' "$f" 2>/dev/null || true
+done
+install -m755 "$APP/MacOS/sh" "$R/System/bin/sh"
+install -m755 "$APP/MacOS/env" "$R/System/bin/env"
+
+say "NVIDIA -> NVIDIA.framework и /System/Applications/NVIDIA.app"
+FW=$R/System/Library/Frameworks/NVIDIA.framework
+mkdir -p "$FW/lib" "$FW/share" "$FW/etc"
+cp -a "$B/nv/usr/lib/x86_64-linux-gnu/." "$FW/lib/"
+for d in "$B"/nv/usr/share/*; do
+    case "$(basename "$d")" in doc|lintian|man|bash-completion) continue ;; esac
+    cp -a "$d" "$FW/share/"
+done
+[ -d "$B/nv/etc" ] && cp -a "$B/nv/etc/." "$FW/etc/"
+mkdir -p "$R/System/Library/Firmware"
+cp -a "$B/nv/lib/firmware/nvidia" "$R/System/Library/Firmware/"
+if [ -d "$B/fw/usr/lib/firmware/amdgpu" ]; then
+    cp -a "$B/fw/usr/lib/firmware/amdgpu" "$R/System/Library/Firmware/"
+elif [ -d "$B/fw/lib/firmware/amdgpu" ]; then
+    cp -a "$B/fw/lib/firmware/amdgpu" "$R/System/Library/Firmware/"
+fi
+NV=$R/System/Applications/NVIDIA.app/Contents
+mkdir -p "$NV/MacOS" "$NV/Resources"
+if [ -d "$B/nv/usr/bin" ]; then
+    cp -a "$B/nv/usr/bin/." "$NV/MacOS/"
+    find "$NV/MacOS" -type f | while read -r f; do
+        is_elf "$f" && patch_exec "$f" '/System/Library/Frameworks/NVIDIA.framework/lib:/System/lib'
+    done
+fi
+cat >"$NV/Info.plist" <<EOF_NVPLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleName</key><string>NVIDIA</string>
+<key>CFBundleIdentifier</key><string>org.fasdeqos.nvidia</string>
+<key>CFBundleVersion</key><string>$NV_VER</string>
+</dict></plist>
+EOF_NVPLIST
+
+say "слой настроек"
+cat >"$OV/System/etc/dinit.d/boot" <<'EOF'
+type = internal
+depends-on = network
+waits-for = nvidia
+waits-for = pkgd
+waits-for = session
+EOF
+cat >"$OV/System/etc/dinit.d/session" <<'EOF'
+type = process
+command = /System/bin/fish --login
+run-as = live
+options = runs-on-console
+env-file = /System/etc/dinit.d/env.live
+restart = true
+smooth-recovery = true
+EOF
+cat >"$OV/System/etc/dinit.d/pkgd" <<'EOF'
+type = process
+command = /System/bin/fish /System/bin/pkgd
+run-as = live
+env-file = /System/etc/dinit.d/env.live
+logfile = /System/var/log/pkgd.log
+logfile-permissions = 644
+restart = true
+EOF
+cat >"$OV/System/etc/dinit.d/nvidia" <<'EOF'
+type = scripted
+command = /System/bin/fish /System/libexec/fasdeqos/nvidia-load.fish
+stop-command = /System/bin/fish /System/libexec/fasdeqos/nvidia-unload.fish
+env-file = /System/etc/dinit.d/environment
+restart = false
+logfile = /System/var/log/nvidia.log
+logfile-permissions = 644
+EOF
+cat >"$OV/System/etc/dinit.d/network" <<'EOF'
+type = scripted
+command = /System/bin/fish /System/libexec/fasdeqos/network.fish
+env-file = /System/etc/dinit.d/environment
+restart = false
+logfile = /System/var/log/network.log
+logfile-permissions = 644
+EOF
+cat >"$OV/System/etc/dinit.d/environment" <<'EOF'
+HOME=/System/var/root
+USER=root
+LOGNAME=root
+SHELL=/System/bin/fish
+PATH=/System/bin:/System/sbin:/System/Applications/Chimerautils.app/Contents/MacOS
+TMPDIR=/System/tmp
+TERM=linux
+LANG=C.UTF-8
+GIT_EXEC_PATH=/System/libexec/git-core
+SSL_CERT_FILE=/System/etc/ssl/certs/ca-certificates.crt
+EOF
+cat >"$OV/System/etc/dinit.d/env.live" <<'EOF'
+HOME=/Users/live
+USER=live
+LOGNAME=live
+SHELL=/System/bin/fish
+PATH=/System/bin:/System/sbin:/System/Applications/Chimerautils.app/Contents/MacOS:/System/Applications/NVIDIA.app/Contents/MacOS:/home/linuxbrew/.linuxbrew/bin
+TMPDIR=/System/tmp
+TERM=linux
+LANG=C.UTF-8
+XDG_CONFIG_DIRS=/System/etc/xdg
+XDG_DATA_DIRS=/System/share:/home/linuxbrew/.linuxbrew/share
+GIT_EXEC_PATH=/System/libexec/git-core
+GIT_TEMPLATE_DIR=/System/share/git-core/templates
+GIT_SSL_CAINFO=/System/etc/ssl/certs/ca-certificates.crt
+SSL_CERT_FILE=/System/etc/ssl/certs/ca-certificates.crt
+CURL_CA_BUNDLE=/System/etc/ssl/certs/ca-certificates.crt
+FLATPAK_BWRAP=/System/bin/bwrap
+HOMEBREW_NO_ANALYTICS=1
+HOMEBREW_NO_ENV_HINTS=1
+EOF
+cat >"$OV/System/etc/fish/config.fish" <<'EOF'
+set -gx PATH /System/bin /System/sbin /System/Applications/Chimerautils.app/Contents/MacOS /System/Applications/NVIDIA.app/Contents/MacOS /home/linuxbrew/.linuxbrew/bin
+set -g fish_greeting ""
+
+if test -f /System/run/gpu-mode; and test (cat /System/run/gpu-mode) = nvidia-primary
+    set -gx LD_LIBRARY_PATH /System/Library/Frameworks/NVIDIA.framework/lib
+    set -gx __GLX_VENDOR_LIBRARY_NAME nvidia
+    set -gx __EGL_VENDOR_LIBRARY_FILENAMES /System/Library/Frameworks/NVIDIA.framework/share/glvnd/egl_vendor.d/10_nvidia.json
+    set -gx VK_ICD_FILENAMES /System/Library/Frameworks/NVIDIA.framework/share/vulkan/icd.d/nvidia_icd.json
+end
+
+function fish_prompt
+    set -l s $status
+    set_color brblue
+    echo -n (prompt_pwd)
+    if test $s -ne 0
+        set_color red
+    else
+        set_color green
+    end
+    echo -n ' ❯ '
+    set_color normal
+end
+
+if status is-login; and status is-interactive
+    command -q fastfetch; and fastfetch
+end
+EOF
+cat >"$OV/System/etc/xdg/fastfetch/config.jsonc" <<'EOF'
+{
+  "logo": { "type": "small" },
+  "display": { "separator": "  " },
+  "modules": [
+    "title",
+    "separator",
+    { "type": "custom", "key": "OS", "format": "FasdeqOS 0.2" },
+    "kernel",
+    "uptime",
+    "shell",
+    "cpu",
+    "gpu",
+    "memory",
+    "disk"
+  ]
+}
+EOF
+cat >"$OV/System/etc/os-release" <<'EOF'
+NAME="FasdeqOS"
+ID=fasdeqos
+PRETTY_NAME="FasdeqOS"
+VERSION_ID="0.2"
+HOME_URL="https://github.com/fasdeq13"
+EOF
+cat >"$OV/System/etc/passwd" <<'EOF'
+root:x:0:0:root:/System/var/root:/System/bin/fish
+live:x:1000:1000:Live:/Users/live:/System/bin/fish
+nobody:x:65534:65534:nobody:/nonexistent:/System/bin/fish
+EOF
+cat >"$OV/System/etc/group" <<'EOF'
+root:x:0:
+live:x:1000:
+nogroup:x:65534:
+EOF
+cat >"$OV/System/etc/nsswitch.conf" <<'EOF'
+passwd: files
+group: files
+shadow: files
+hosts: files dns
+networks: files
+protocols: files
+services: files
+EOF
+printf '127.0.0.1 localhost fasdeq\n' >"$OV/System/etc/hosts"
+: >"$OV/System/etc/resolv.conf"
+printf 'fasdeq\n' >"$OV/System/etc/hostname"
+cat >"$OV/System/etc/ld.so.conf" <<'EOF'
+/System/lib
+EOF
+cat >"$OV/System/etc/modprobe.d/gpu.conf" <<'EOF'
+blacklist nouveau
+EOF
+
+cat >"$OV/System/libexec/fasdeqos/nvidia-load.fish" <<'EOF'
+#!/System/bin/fish
+set -x PATH /System/bin /System/sbin /System/Applications/Chimerautils.app/Contents/MacOS
+
+set -l nv 0
+set -l other 0
+for d in /sys/bus/pci/devices/*
+    set -l c (cat $d/class 2>/dev/null)
+    string match -q '0x03*' -- $c; or continue
+    if test (cat $d/vendor) = 0x10de
+        set nv (math $nv + 1)
+    else
+        set other (math $other + 1)
+    end
+end
