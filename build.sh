@@ -305,3 +305,163 @@ int main(void)
 	return 1;
 }
 EOF_INIT
+cat >"$B/kernel.fragment" <<'EOF_KCFG'
+CONFIG_LOCALVERSION="-fasdeqos"
+CONFIG_DEFAULT_HOSTNAME="fasdeq"
+CONFIG_BLK_DEV_INITRD=y
+CONFIG_RD_ZSTD=y
+CONFIG_KERNEL_ZSTD=y
+CONFIG_BTRFS_FS=y
+CONFIG_BTRFS_FS_POSIX_ACL=y
+CONFIG_SQUASHFS=y
+CONFIG_ISO9660_FS=y
+CONFIG_JOLIET=y
+CONFIG_ZISOFS=y
+CONFIG_OVERLAY_FS=y
+CONFIG_TMPFS=y
+CONFIG_TMPFS_POSIX_ACL=y
+CONFIG_DEVTMPFS=y
+CONFIG_DEVTMPFS_MOUNT=y
+CONFIG_INOTIFY_USER=y
+CONFIG_USER_NS=y
+CONFIG_PID_NS=y
+CONFIG_NET_NS=y
+CONFIG_IPC_NS=y
+CONFIG_UTS_NS=y
+CONFIG_CGROUPS=y
+CONFIG_BLK_DEV_LOOP=y
+CONFIG_BLK_DEV_SR=y
+CONFIG_ATA=y
+CONFIG_SATA_AHCI=y
+CONFIG_ATA_PIIX=y
+CONFIG_BLK_DEV_NVME=y
+CONFIG_USB_STORAGE=y
+CONFIG_USB_XHCI_HCD=y
+CONFIG_USB_EHCI_HCD=y
+CONFIG_USB_UAS=y
+CONFIG_VIRTIO_BLK=y
+CONFIG_VIRTIO_PCI=y
+CONFIG_VIRTIO_NET=y
+CONFIG_E1000=y
+CONFIG_E1000E=y
+CONFIG_R8169=y
+CONFIG_IGB=y
+CONFIG_EFI=y
+CONFIG_EFI_STUB=y
+CONFIG_FB=y
+CONFIG_FB_EFI=y
+CONFIG_FB_SIMPLE=y
+CONFIG_DRM=y
+CONFIG_DRM_FBDEV_EMULATION=y
+CONFIG_DRM_SIMPLEDRM=y
+CONFIG_DRM_VIRTIO_GPU=y
+CONFIG_DRM_AMDGPU=m
+CONFIG_DRM_AMDGPU_SI=y
+CONFIG_DRM_AMDGPU_CIK=y
+CONFIG_DRM_NOUVEAU=n
+CONFIG_DRM_I915=n
+CONFIG_DRM_RADEON=n
+CONFIG_DRM_XE=n
+CONFIG_DRM_VMWGFX=n
+CONFIG_DRM_QXL=n
+CONFIG_DRM_BOCHS=n
+CONFIG_DRM_CIRRUS_QEMU=n
+CONFIG_FW_LOADER_COMPRESS=y
+CONFIG_FW_LOADER_COMPRESS_ZSTD=y
+CONFIG_FRAMEBUFFER_CONSOLE=y
+CONFIG_SERIAL_8250=y
+CONFIG_SERIAL_8250_CONSOLE=y
+CONFIG_MODULES=y
+CONFIG_MODULE_UNLOAD=y
+CONFIG_MODVERSIONS=n
+CONFIG_MODULE_COMPRESS_NONE=y
+CONFIG_PCI=y
+CONFIG_MMU_NOTIFIER=y
+CONFIG_HMM_MIRROR=y
+CONFIG_INPUT_EVDEV=y
+CONFIG_HID_GENERIC=y
+CONFIG_USB_HID=y
+CONFIG_HIGH_RES_TIMERS=y
+CONFIG_NO_HZ_IDLE=y
+CONFIG_PREEMPT=y
+CONFIG_DEBUG_INFO=n
+CONFIG_DEBUG_INFO_BTF=n
+CONFIG_SOUND=n
+CONFIG_WIRELESS=n
+CONFIG_BT=n
+CONFIG_NFS_FS=n
+CONFIG_XFS_FS=n
+CONFIG_KVM=n
+CONFIG_XEN=n
+CONFIG_HYPERV=n
+CONFIG_NETFILTER=n
+CONFIG_MEDIA_SUPPORT=n
+CONFIG_INFINIBAND=n
+CONFIG_STAGING=n
+CONFIG_SND=n
+CONFIG_SECURITY_SELINUX=n
+CONFIG_SECURITY_APPARMOR=n
+CONFIG_AUDIT=n
+CONFIG_PCCARD=n
+CONFIG_ISDN=n
+CONFIG_FPGA=n
+CONFIG_EXT4_FS=y
+CONFIG_VFAT_FS=y
+CONFIG_FAT_FS=y
+CONFIG_NLS_CODEPAGE_437=y
+CONFIG_NLS_ISO8859_1=y
+CONFIG_NLS_UTF8=y
+EOF_KCFG
+
+say "glibc 2.40 (пути /System/etc и /System/bin/sh вшиваются в libc)"
+cd "$S/glibc"
+for f in $(grep -rlE '"/etc/|_PATH_BSHELL' nss resolv misc elf sysdeps/generic sysdeps/unix/sysv/linux 2>/dev/null | grep -vE '/(tst|test|bug)[^/]*$'); do
+    sed -i -e 's|"/etc/|"/System/etc/|g' -e 's|"/bin/sh"|"/System/bin/sh"|g' "$f"
+done
+mkdir -p "$B/glibc-build"
+cd "$B/glibc-build"
+if [ ! -f Makefile ]; then
+    "$S/glibc/configure" --prefix=/System --libdir=/System/lib --libexecdir=/System/libexec \
+        --sysconfdir=/System/etc --localstatedir=/System/var --disable-werror --disable-nscd \
+        --disable-sanity-checks --enable-kernel=5.4 --without-selinux --disable-profile \
+        --disable-timezone-tools CFLAGS="-O2 -pipe -U_FORTIFY_SOURCE" >"$L/glibc-configure.log" 2>&1
+fi
+make -j"$J" >"$L/glibc-make.log" 2>&1
+
+say "корень"
+rm -rf "$R"
+mkdir -p "$R/System"
+rm -f /System
+ln -s "$R/System" /System
+make -C "$B/glibc-build" install DESTDIR="$R" >"$L/glibc-install.log" 2>&1
+
+mkdir -p "$R/System/lib/locale"
+localedef -i "$S/glibc/localedata/locales/C" -f UTF-8 -c --no-archive "$R/System/lib/locale/C.utf8" >"$L/localedef.log" 2>&1 || true
+
+say "libxo"
+cd "$S/libxo"
+[ -f configure ] || autoreconf -fi >"$L/libxo-autoreconf.log" 2>&1
+mkdir -p "$B/libxo-build"
+cd "$B/libxo-build"
+[ -f Makefile ] || "$S/libxo/configure" --prefix=/System --libdir=/System/lib --disable-gettext \
+    --disable-dependency-tracking >"$L/libxo-configure.log" 2>&1
+make -j"$J" >"$L/libxo-make.log" 2>&1
+make install DESTDIR="$R" >"$L/libxo-install.log" 2>&1
+
+say "kmod"
+if [ ! -d "$B/kmod-build" ]; then
+    meson setup "$B/kmod-build" "$S/kmod" --prefix=/System --bindir=/System/bin --sbindir=/System/sbin \
+        --libdir=/System/lib --sysconfdir=/System/etc -Dmoduledir=/System/Library/Extensions \
+        -Dzstd=enabled -Dxz=enabled -Dzlib=enabled -Dopenssl=disabled -Dmbedtls=disabled \
+        -Dmanpages=false -Ddocs=false >"$L/kmod-setup.log" 2>&1
+fi
+ninja -C "$B/kmod-build" >"$L/kmod-ninja.log" 2>&1
+DESTDIR="$R" ninja -C "$B/kmod-build" install >"$L/kmod-install.log" 2>&1
+
+say "dinit"
+cd "$S/dinit"
+[ -f mconfig ] || ./configure --prefix=/System --exec-prefix=/System --sbindir=/System/sbin \
+    --mandir=/System/share/man --syscontrolsocket=/System/run/dinitctl --disable-strip \
+    LDFLAGS_EXTRA="-static-libstdc++ -static-libgcc" >"$L/dinit-configure.log" 2>&1
+make -j"$J" >"$L/dinit-make.log" 2>&1
+make install DESTDIR="$R" >"$L/dinit-install.log" 2>&1
