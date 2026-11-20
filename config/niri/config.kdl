@@ -1,0 +1,163 @@
+prefer-no-csd
+
+hotkey-overlay {
+    skip-at-startup
+}
+
+input {
+    keyboard {
+        xkb {
+            layout "us"
+        }
+    }
+    touchpad {
+        tap
+        dwt
+        natural-scroll
+        click-method "clickfinger"
+        scroll-method "two-finger"
+    }
+}
+
+layout {
+    gaps 6
+    center-focused-column "never"
+    default-column-width { proportion 0.5; }
+}
+
+window-rule {
+    geometry-corner-radius 8
+    clip-to-geometry true
+}
+
+window-rule {
+    match app-id="^(Throne)$"
+    open-floating true
+}
+
+
+window-rule {
+    match app-id="^steam_app_.*"
+    match app-id="^gamescope"
+    open-fullscreen true
+}
+binds {
+    Mod+O { toggle-overview; }
+    Mod+T { spawn "ghostty"; }
+    Mod+Return { spawn "ghostty"; }
+    Mod+E { spawn "nautilus"; }
+    Ctrl+Alt+E { spawn "nautilus"; }
+    Ctrl+Alt+T { spawn "ghostty"; }
+    Mod+B { spawn "firefox"; }
+    Mod+Q { close-window; }
+    Alt+F4 { close-window; }
+    Mod+F { maximize-column; }
+    Mod+Shift+F { fullscreen-window; }
+    Mod+Shift+V { toggle-window-floating; }
+    Mod+W { focus-window-or-workspace-up; }
+    Mod+A { focus-column-left; }
+    Mod+S { focus-window-or-workspace-down; }
+    Mod+D { focus-column-right; }
+    Mod+Left { focus-column-left; }
+    Mod+Right { focus-column-right; }
+    Mod+Up { focus-window-or-workspace-up; }
+    Mod+Down { focus-window-or-workspace-down; }
+    Mod+Shift+Left { move-column-left; }
+    Mod+Shift+Right { move-column-right; }
+    Mod+Shift+Up { move-window-up-or-to-workspace-up; }
+    Mod+Shift+Down { move-window-down-or-to-workspace-down; }
+    Mod+Minus { set-column-width "-10%"; }
+    Mod+Shift+Minus { set-window-height "-10%"; }
+    Mod+Equal { set-column-width "+10%"; }
+    Mod+Shift+Equal { set-window-height "+10%"; }
+    Mod+1 { focus-workspace 1; }
+    Mod+2 { focus-workspace 2; }
+    Mod+3 { focus-workspace 3; }
+    Mod+4 { focus-workspace 4; }
+    Mod+5 { focus-workspace 5; }
+    Mod+6 { focus-workspace 6; }
+    Mod+7 { focus-workspace 7; }
+    Mod+8 { focus-workspace 8; }
+    Mod+9 { focus-workspace 9; }
+    Mod+Ctrl+1 { move-column-to-workspace 1; }
+    Mod+Ctrl+2 { move-column-to-workspace 2; }
+    Mod+Ctrl+3 { move-column-to-workspace 3; }
+    Mod+Ctrl+4 { move-column-to-workspace 4; }
+    Mod+Ctrl+5 { move-column-to-workspace 5; }
+    Mod+Ctrl+6 { move-column-to-workspace 6; }
+    Mod+Ctrl+7 { move-column-to-workspace 7; }
+    Mod+Ctrl+8 { move-column-to-workspace 8; }
+    Mod+Ctrl+9 { move-column-to-workspace 9; }
+    Mod+Shift+S { spawn "qs" "ipc" "call" "shell" "screenshotArea"; }
+    Print { spawn "qs" "ipc" "call" "shell" "screenshotScreen"; }
+    Mod+Print { spawn "qs" "ipc" "call" "shell" "screenshot"; }
+    Alt+Space { spawn "qs" "ipc" "call" "shell" "launcher"; }
+    Mod+Shift+P { spawn "qs" "ipc" "call" "shell" "power"; }
+    Mod+Shift+A { spawn "qs" "ipc" "call" "shell" "settings"; }
+    Mod+Shift+C { spawn "qs" "ipc" "call" "shell" "calendar"; }
+    Mod+Shift+M { spawn "qs" "ipc" "call" "shell" "audio"; }
+    Mod+Shift+N { spawn "qs" "ipc" "call" "shell" "network"; }
+    Mod+Shift+B { spawn "qs" "ipc" "call" "shell" "bluetooth"; }
+    Alt+Print { spawn "qs" "ipc" "call" "shell" "screenshotWindow"; }
+    XF86AudioRaiseVolume allow-when-locked=true { spawn "wpctl" "set-volume" "-l" "1.5" "@DEFAULT_AUDIO_SINK@" "5%+"; }
+    XF86AudioLowerVolume allow-when-locked=true { spawn "wpctl" "set-volume" "@DEFAULT_AUDIO_SINK@" "5%-"; }
+    XF86AudioMute allow-when-locked=true { spawn "wpctl" "set-mute" "@DEFAULT_AUDIO_SINK@" "toggle"; }
+    XF86AudioPlay allow-when-locked=true { spawn "playerctl" "play-pause"; }
+    XF86AudioNext allow-when-locked=true { spawn "playerctl" "next"; }
+    XF86AudioPrev allow-when-locked=true { spawn "playerctl" "previous"; }
+    XF86MonBrightnessUp allow-when-locked=true { spawn "brightnessctl" "set" "5%+"; }
+    XF86MonBrightnessDown allow-when-locked=true { spawn "brightnessctl" "set" "5%-"; }
+    Mod+Shift+Slash { show-hotkey-overlay; }
+    Mod+K { show-hotkey-overlay; }
+    Mod+Shift+E { quit; }
+    Mod+TouchpadScrollDown cooldown-ms=200 { focus-workspace-down; }
+    Mod+TouchpadScrollUp cooldown-ms=200 { focus-workspace-up; }
+    Mod+TouchpadScrollRight { focus-column-right; }
+    Mod+TouchpadScrollLeft { focus-column-left; }
+    Mod+Shift+TouchpadScrollDown cooldown-ms=200 { move-column-to-workspace-down; }
+    Mod+Shift+TouchpadScrollUp cooldown-ms=200 { move-column-to-workspace-up; }
+    Mod+Shift+TouchpadScrollRight { move-column-right; }
+    Mod+Shift+TouchpadScrollLeft { move-column-left; }
+    Mod+Ctrl+TouchpadScrollUp { set-window-height "+5%"; }
+    Mod+Ctrl+TouchpadScrollDown { set-window-height "-5%"; }
+    Mod+Ctrl+TouchpadScrollRight { set-column-width "+5%"; }
+    Mod+Ctrl+TouchpadScrollLeft { set-column-width "-5%"; }
+    Mod+WheelScrollDown cooldown-ms=150 { focus-workspace-down; }
+    Mod+WheelScrollUp cooldown-ms=150 { focus-workspace-up; }
+    Mod+WheelScrollRight { focus-column-right; }
+    Mod+WheelScrollLeft { focus-column-left; }
+    Mod+Shift+WheelScrollDown cooldown-ms=150 { move-column-to-workspace-down; }
+    Mod+Shift+WheelScrollUp cooldown-ms=150 { move-column-to-workspace-up; }
+}
+
+
+gestures {
+    hot-corners {
+        off
+    }
+}
+
+spawn-at-startup "/usr/local/bin/fasd-first"
+spawn-at-startup "qs"
+spawn-at-startup "/usr/local/bin/fasd-wallpaper"
+spawn-at-startup "/usr/lib/polkit-gnome/polkit-gnome-authentication-agent-1"
+spawn-at-startup "xdg-user-dirs-update"
+spawn-at-startup "gnome-keyring-daemon" "--start" "--components=secrets"
+
+window-rule {
+    match app-id=r#"^steam$"# title=r#"^notificationtoasts_\d+_desktop$"#
+    default-floating-position x=10 y=10 relative-to="bottom-right"
+    open-focused false
+}
+
+window-rule {
+    match app-id=r#"^steam$"#
+    exclude title=r#"^Steam$"#
+    open-floating true
+}
+
+environment {
+    QT_QPA_PLATFORMTHEME "qt6ct"
+}
+
+include "colors.kdl"

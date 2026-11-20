@@ -1,0 +1,11 @@
+[Trigger]
+Operation = Install
+Operation = Remove
+Operation = Upgrade
+Type = Package
+Target = *
+
+[Action]
+Description = Updating /Applications and /System views
+When = PostTransaction
+Exec = /usr/local/bin/fasd-layout

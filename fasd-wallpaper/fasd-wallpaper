@@ -1,0 +1,11 @@
+#!/bin/sh
+D=$HOME/.config/fasdeqos
+W=$D/wallpaper
+mkdir -p "$D"
+if [ -n "${1:-}" ]; then
+    [ -f "$1" ] || { echo "no such file"; exit 1; }
+    ln -sfn "$(readlink -f "$1")" "$W"
+fi
+[ -e "$W" ] || ln -sfn /usr/share/backgrounds/fasdeqos/wallpaper.jpg "$W"
+pkill -x swaybg
+exec swaybg -m fill -i "$W"

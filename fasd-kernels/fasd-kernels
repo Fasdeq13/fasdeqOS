@@ -1,0 +1,27 @@
+#!/bin/sh
+E=/boot/loader/entries
+B=$E/fasdeqos.conf
+[ -f "$B" ] || exit 0
+OPT=$(sed -n 's/^options //p' "$B" | head -n 1)
+UC=$(sed -n 's#^initrd \(/[a-z]*-ucode.img\)$#\1#p' "$B" | head -n 1)
+for k in /boot/vmlinuz-*; do
+    [ -f "$k" ] || continue
+    n=${k#/boot/vmlinuz-}
+    [ "$n" = linux ] && continue
+    [ -f "/boot/initramfs-$n.img" ] || continue
+    {
+        echo "title FasdeqOS ($n)"
+        echo "linux /vmlinuz-$n"
+        [ -n "$UC" ] && echo "initrd $UC"
+        echo "initrd /initramfs-$n.img"
+        echo "options $OPT"
+    } >"$E/fasdeqos-$n.conf"
+done
+for f in "$E"/fasdeqos-*.conf; do
+    [ -f "$f" ] || continue
+    n=${f#"$E"/fasdeqos-}
+    n=${n%.conf}
+    [ "$n" = fallback ] && continue
+    [ -f "/boot/vmlinuz-$n" ] || rm -f "$f"
+done
+exit 0

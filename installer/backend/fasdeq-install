@@ -1,0 +1,176 @@
+#!/bin/bash
+CONF=${1:-}
+[ -r "$CONF" ] || { echo "@ERR configuration file is missing"; exit 1; }
+. "$CONF"
+rm -f "$CONF"
+LOGF=/tmp/fasdeq-install.log
+: >"$LOGF"
+step() { echo "@STEP $1 6 $2"; }
+pct() { echo "@PCT $1"; }
+fail() {
+    echo "@ERR $*"
+    tail -n 4 "$LOGF" | while IFS= read -r l; do echo "@LOG $l"; done
+    exit 1
+}
+set -eE -o pipefail
+trap 'fail "failed at line $LINENO"' ERR
+echo "@PLAN Partitioning disk|Creating file systems|Installing the system|Configuring accounts|Locale, time zone and swap|Installing the boot loader"
+for v in DISK LOCALE TIMEZONE HOSTNAME USERNAME USER_HASH; do
+    [ -n "${!v:-}" ] || fail "missing setting $v"
+done
+[ -b "$DISK" ] || fail "$DISK is not a block device"
+[ -d /sys/firmware/efi ] || fail "UEFI is required"
+umount -R /mnt 2>/dev/null || true
+case "$DISK" in *nvme*|*mmcblk*) PP=p ;; *) PP= ;; esac
+
+step 1 "Partitioning disk"
+pct 2
+sgdisk -Z "$DISK" >>"$LOGF" 2>&1
+sgdisk -n1:0:+1G -t1:ef00 -c1:ESP -n2:0:0 -t2:8300 -c2:fasdeqos "$DISK" >>"$LOGF" 2>&1
+partprobe "$DISK" >>"$LOGF" 2>&1 || true
+sleep 2
+
+step 2 "Creating file systems"
+pct 8
+mkfs.fat -F32 "${DISK}${PP}1" >>"$LOGF" 2>&1
+mkfs.btrfs -f -L fasdeqos "${DISK}${PP}2" >>"$LOGF" 2>&1
+mount "${DISK}${PP}2" /mnt
+btrfs subvolume create /mnt/@ >>"$LOGF" 2>&1
+btrfs subvolume create /mnt/@users >>"$LOGF" 2>&1
+umount /mnt
+MO=noatime,compress=zstd:3,ssd
+mount -o $MO,subvol=@ "${DISK}${PP}2" /mnt
+mkdir -p /mnt/Users /mnt/boot
+mount -o $MO,subvol=@users "${DISK}${PP}2" /mnt/Users
+mount -o umask=0077 "${DISK}${PP}1" /mnt/boot
+
+step 3 "Installing the system"
+pct 12
+PK=$(grep -v '^#' /usr/share/fasdeqos/packages.installed | tr '\n' ' ')
+grep -qi AuthenticAMD /proc/cpuinfo && PK="$PK amd-ucode"
+grep -qi GenuineIntel /proc/cpuinfo && PK="$PK intel-ucode"
+GPU=$(lspci | grep -Ei "vga|3d|display")
+AMDG=0
+INTG=0
+echo "$GPU" | grep -qiE "amd|ati|radeon" && { AMDG=1; PK="$PK vulkan-radeon"; }
+echo "$GPU" | grep -qi intel && { INTG=1; PK="$PK vulkan-intel"; }
+NV=0
+if lspci | grep -qi 'vga.*nvidia\|3d.*nvidia'; then
+    NV=1
+    PK="$PK linux-headers dkms nvidia-open-dkms nvidia-utils lib32-nvidia-utils nvidia-settings"
+fi
+sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /etc/pacman.conf
+pacman -Sy --noconfirm >>"$LOGF" 2>&1 || true
+OPT="nautilus-open-any-terminal steam"
+[ "$NV" = 0 ] && OPT="$OPT lib32-mesa"
+[ "$AMDG" = 1 ] && OPT="$OPT lib32-vulkan-radeon"
+[ "$INTG" = 1 ] && OPT="$OPT lib32-vulkan-intel"
+for p in $OPT; do
+    pacman -Si "$p" >/dev/null 2>&1 && PK="$PK $p"
+done
+pacstrap -K /mnt base linux linux-firmware $PK 2>&1 | while IFS= read -r l; do
+    echo "$l" >>"$LOGF"
+    echo "@LOG ${l:0:90}"
+done
+pct 80
+sed -i '/^#\[multilib\]/,/^#Include/ s/^#//' /mnt/etc/pacman.conf
+genfstab -U /mnt >/mnt/etc/fstab
+mkdir -p /mnt/etc/skel /mnt/usr/share/fasdeqos /mnt/etc/pacman.d/hooks /mnt/usr/share/fish/vendor_completions.d /mnt/Applications/tui
+cp -a /usr/share/fasdeqos/skel/. /mnt/etc/skel/
+install -Dm755 /usr/local/bin/pkg /mnt/usr/local/bin/pkg
+install -Dm755 /usr/local/bin/fasd-wallpaper /mnt/usr/local/bin/fasd-wallpaper
+install -Dm755 /usr/local/bin/fasd-kernels /mnt/usr/local/bin/fasd-kernels
+cp /usr/share/fasdeqos/fasd-kernels.hook /mnt/etc/pacman.d/hooks/
+mkdir -p /mnt/usr/share/backgrounds/fasdeqos /mnt/Applications/shells
+cp /usr/share/backgrounds/fasdeqos/wallpaper.jpg /mnt/usr/share/backgrounds/fasdeqos/
+cp /usr/share/fasdeqos/black.conf /mnt/usr/share/fasdeqos/black.conf
+install -Dm755 /usr/local/bin/fasd-pkgbackend /mnt/usr/local/bin/fasd-pkgbackend
+cp /usr/share/fasdeqos/fasd-pkgbackend.hook /mnt/etc/pacman.d/hooks/
+mkdir -p /mnt/usr/share/fish/vendor_conf.d
+cp /usr/share/fasdeqos/fasd-ls.fish /mnt/usr/share/fish/vendor_conf.d/fasd-ls.fish
+install -Dm755 /usr/local/bin/fasd-upgrade /mnt/usr/local/bin/fasd-upgrade
+install -Dm644 /usr/share/fasdeqos/repo.conf /mnt/etc/fasdeqos/repo.conf
+install -Dm755 /usr/local/bin/fasd-apps /mnt/usr/local/bin/fasd-apps
+install -Dm755 /usr/local/bin/fasd-layout /mnt/usr/local/bin/fasd-layout
+install -Dm755 /usr/local/bin/fasd-first /mnt/usr/local/bin/fasd-first
+cp /usr/share/fasdeqos/system.list /mnt/usr/share/fasdeqos/
+cp /usr/share/fasdeqos/fasd-layout.hook /mnt/etc/pacman.d/hooks/fasd-layout.hook
+cp /usr/share/fasdeqos/pkg.fish /mnt/usr/share/fish/vendor_completions.d/pkg.fish
+cp /usr/share/fasdeqos/units/fasd-apps.service /usr/share/fasdeqos/units/fasd-apps.path /mnt/etc/systemd/system/
+cp /usr/share/fasdeqos/os-release /mnt/etc/os-release
+cp /usr/share/fasdeqos/logo.ansi /mnt/usr/share/fasdeqos/logo.ansi
+install -Dm755 /usr/local/bin/fasd-outputs /mnt/usr/local/bin/fasd-outputs
+install -Dm755 /usr/local/bin/fasd-fasdquery /mnt/usr/local/bin/fasd-fasdquery
+install -Dm755 /usr/local/bin/fastab /mnt/usr/local/bin/fastab
+mkdir -p /mnt/etc/NetworkManager/system-connections
+cp -a /etc/NetworkManager/system-connections/. /mnt/etc/NetworkManager/system-connections/ 2>/dev/null || true
+chmod 0777 /mnt/Applications /mnt/Applications/tui /mnt/Applications/shells
+
+step 4 "Configuring accounts"
+pct 84
+echo "$HOSTNAME" >/mnt/etc/hostname
+arch-chroot /mnt useradd -m -d "/Users/$USERNAME" -G wheel,video,audio,input,render,lp -s /usr/bin/fish -p "$USER_HASH" "$USERNAME" >>"$LOGF" 2>&1
+if [ -n "${ROOT_HASH:-}" ]; then
+    arch-chroot /mnt usermod -p "$ROOT_HASH" root >>"$LOGF" 2>&1
+else
+    arch-chroot /mnt passwd -l root >>"$LOGF" 2>&1
+fi
+printf 'permit persist :wheel\n' >/mnt/etc/doas.conf
+chmod 0400 /mnt/etc/doas.conf
+if [ -f /mnt/etc/pam.d/ly ]; then
+    printf 'auth optional pam_gnome_keyring.so\nsession optional pam_gnome_keyring.so auto_start\n' >>/mnt/etc/pam.d/ly
+fi
+
+step 5 "Locale, time zone and swap"
+pct 88
+case "$LOCALE" in *.*) LC=$LOCALE ;; *) LC=$LOCALE.UTF-8 ;; esac
+echo "$LC UTF-8" >>/mnt/etc/locale.gen
+echo "en_US.UTF-8 UTF-8" >>/mnt/etc/locale.gen
+echo "LANG=$LC" >/mnt/etc/locale.conf
+echo "KEYMAP=us" >/mnt/etc/vconsole.conf
+ln -sf "/usr/share/zoneinfo/$TIMEZONE" /mnt/etc/localtime
+arch-chroot /mnt locale-gen >>"$LOGF" 2>&1
+arch-chroot /mnt hwclock --systohc >>"$LOGF" 2>&1 || true
+LAY=us
+case "${LOCALE%%_*}" in ru) X=ru ;; uk) X=ua ;; be) X=by ;; kk) X=kz ;; de) X=de ;; fr) X=fr ;; es) X=es ;; it) X=it ;; pt) X=br ;; *) X= ;; esac
+for x in $X ${FASD_KB//,/ }; do
+    case ",$LAY," in *",$x,"*) ;; *) LAY="$LAY,$x" ;; esac
+done
+CK=/mnt/etc/skel/.config/niri/config.kdl
+if [ "$LAY" != us ]; then
+    sed -i "s|layout \"us\"|layout \"$LAY\"|" "$CK"
+    sed -i 's|^\(\s*\)xkb {|\1xkb {\n\1    options "grp:alt_shift_toggle,grp:win_space_toggle"|' "$CK"
+fi
+cp "$CK" "/mnt/Users/$USERNAME/.config/niri/config.kdl" 2>/dev/null || true
+chown -R "$(arch-chroot /mnt id -u "$USERNAME"):$(arch-chroot /mnt id -g "$USERNAME")" "/mnt/Users/$USERNAME" 2>/dev/null || true
+if [ "${ZRAM_MB:-0}" -gt 0 ]; then
+    printf '[zram0]\nzram-size = %s\ncompression-algorithm = %s\n' "$ZRAM_MB" "${ZRAM_ALGO:-zstd}" >/mnt/etc/systemd/zram-generator.conf
+fi
+if [ "${SWAPFILE_MB:-0}" -gt 0 ]; then
+    btrfs filesystem mkswapfile --size "${SWAPFILE_MB}m" /mnt/swapfile >>"$LOGF" 2>&1
+    echo "/swapfile none swap defaults 0 0" >>/mnt/etc/fstab
+fi
+
+step 6 "Installing the boot loader"
+pct 92
+arch-chroot /mnt systemctl enable fasd-apps.path fasd-apps.service NetworkManager bluetooth cups sshd power-profiles-daemon systemd-timesyncd >>"$LOGF" 2>&1
+arch-chroot /mnt /usr/local/bin/fasd-fasdquery >>"$LOGF" 2>&1 || true
+arch-chroot /mnt /bin/bash -c 'if [ -f /usr/lib/systemd/system/ly@.service ]; then systemctl enable ly@tty2.service; else systemctl enable ly.service; fi; systemctl set-default graphical.target; /usr/local/bin/fasd-layout' >>"$LOGF" 2>&1
+arch-chroot /mnt /usr/local/bin/fasd-pkgbackend >>"$LOGF" 2>&1 || true
+arch-chroot /mnt bootctl install >>"$LOGF" 2>&1 || true
+ROOTUUID=$(blkid -s UUID -o value "${DISK}${PP}2")
+UCODE=""
+[ -f /mnt/boot/amd-ucode.img ] && UCODE="initrd /amd-ucode.img"
+[ -f /mnt/boot/intel-ucode.img ] && UCODE="initrd /intel-ucode.img"
+printf 'default fasdeqos.conf\ntimeout 3\nconsole-mode max\neditor no\n' >/mnt/boot/loader/loader.conf
+mkdir -p /mnt/boot/loader/entries
+KO="root=UUID=$ROOTUUID rootflags=subvol=@ rw iommu=pt"
+[ "$NV" = 1 ] && KO="$KO nvidia-drm.modeset=1"
+{ echo "title FasdeqOS"; echo "linux /vmlinuz-linux"; [ -n "$UCODE" ] && echo "$UCODE"; echo "initrd /initramfs-linux.img"; echo "options $KO"; } >/mnt/boot/loader/entries/fasdeqos.conf
+{ echo "title FasdeqOS (fallback)"; echo "linux /vmlinuz-linux"; [ -n "$UCODE" ] && echo "$UCODE"; echo "initrd /initramfs-linux-fallback.img"; echo "options $KO"; } >/mnt/boot/loader/entries/fasdeqos-fallback.conf
+printf '\\EFI\\BOOT\\BOOTX64.EFI\r\n' >/mnt/boot/startup.nsh
+efibootmgr -c -d "$DISK" -p 1 -L FasdeqOS -l '\EFI\systemd\systemd-bootx64.efi' >/dev/null 2>&1 || true
+efibootmgr -c -d "$DISK" -p 1 -L "FasdeqOS (fallback)" -l '\EFI\BOOT\BOOTX64.EFI' >/dev/null 2>&1 || true
+sync
+pct 100
+echo "@DONE"

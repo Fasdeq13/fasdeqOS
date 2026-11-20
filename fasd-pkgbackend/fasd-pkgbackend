@@ -1,0 +1,6 @@
+#!/bin/sh
+mkdir -p /System
+if [ -f /usr/bin/pacman ] && [ ! -L /usr/bin/pacman ]; then
+    mv -f /usr/bin/pacman /System/pkg-backend
+fi
+exit 0

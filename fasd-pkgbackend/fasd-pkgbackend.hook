@@ -1,0 +1,10 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Type = Package
+Target = pacman
+
+[Action]
+Description = Moving the package backend into /System
+When = PostTransaction
+Exec = /usr/local/bin/fasd-pkgbackend

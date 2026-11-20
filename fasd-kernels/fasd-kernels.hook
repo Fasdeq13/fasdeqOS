@@ -1,0 +1,12 @@
+[Trigger]
+Operation = Install
+Operation = Upgrade
+Operation = Remove
+Type = Package
+Target = linux
+Target = linux-*
+
+[Action]
+Description = Updating kernel boot entries
+When = PostTransaction
+Exec = /usr/local/bin/fasd-kernels

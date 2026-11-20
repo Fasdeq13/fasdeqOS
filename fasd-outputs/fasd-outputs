@@ -1,0 +1,34 @@
+#!/bin/sh
+C=$HOME/.config/niri/config.kdl
+n=0
+while [ $n -lt 100 ]; do
+    niri msg version >/dev/null 2>&1 && break
+    n=$((n + 1))
+    sleep 0.2
+done
+json=$(niri msg --json outputs 2>/dev/null) || exit 0
+printf '%s' "$json" | awk 'BEGIN { RS = "\"name\":\"" }
+NR > 1 {
+    name = substr($0, 1, index($0, "\"") - 1)
+    bw = 0; bh = 0; br = 0
+    s = $0
+    while (match(s, /"width":[0-9]+,"height":[0-9]+,"refresh_rate":[0-9]+/)) {
+        m = substr(s, RSTART, RLENGTH)
+        s = substr(s, RSTART + RLENGTH)
+        split(m, a, /[^0-9]+/)
+        w = a[2] + 0; h = a[3] + 0; r = a[4] + 0
+        if (w * h > bw * bh || (w * h == bw * bh && r > br)) { bw = w; bh = h; br = r }
+    }
+    v = (index($0, "\"vrr_supported\":true") > 0) ? 1 : 0
+    if (bw > 0) printf "%s %dx%d@%d.%03d %d\n", name, bw, bh, int(br / 1000), br % 1000, v
+}' | while read -r name mode vrr; do
+    niri msg output "$name" mode "$mode" >/dev/null 2>&1
+    [ -f "$C" ] || continue
+    grep -q "^output \"$name\"" "$C" && continue
+    {
+        printf '\noutput "%s" {\n    mode "%s"\n' "$name" "$mode"
+        [ "$vrr" = 1 ] && printf '    variable-refresh-rate on-demand=true\n'
+        printf '}\n'
+    } >>"$C"
+done
+exit 0

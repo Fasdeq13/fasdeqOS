@@ -1,0 +1,35 @@
+#!/bin/sh
+icons() {
+    for d in /Applications/*.app; do
+        [ -d "$d" ] || continue
+        gio info -a metadata::custom-icon "$d" 2>/dev/null | grep -q 'custom-icon' && continue
+        ic=$(sed -n 's/^Icon=//p' "$d/Contents/Desktop" 2>/dev/null | head -n 1)
+        [ -n "$ic" ] || continue
+        case "$ic" in
+            /*) f=$ic ;;
+            *) f=$(find /usr/share/icons/Papirus-Dark/64x64/apps /usr/share/icons/hicolor/scalable/apps /usr/share/icons/hicolor/256x256/apps /usr/share/pixmaps /usr/local/share/icons /usr/local/share/fasdeqos/icons -name "$ic.*" 2>/dev/null | head -n 1) ;;
+        esac
+        [ -n "$f" ] && gio set "$d" metadata::custom-icon "file://$f" 2>/dev/null
+    done
+}
+M=$HOME/.config/fasdeqos/first-done
+if [ ! -f "$M" ]; then
+    mkdir -p "$HOME/.config/fasdeqos" "$HOME/.config/gtk-3.0"
+    xdg-user-dirs-update
+    {
+        echo "file:///Applications Applications"
+        for k in DOWNLOAD DOCUMENTS PICTURES MUSIC VIDEOS; do
+            d=$(xdg-user-dir "$k")
+            echo "file://$d $(basename "$d")"
+        done
+    } >"$HOME/.config/gtk-3.0/bookmarks"
+    gsettings set org.gnome.desktop.interface icon-theme Papirus-Dark
+    gsettings set org.gnome.desktop.interface color-scheme prefer-dark
+    gsettings set org.gnome.desktop.interface gtk-theme Adwaita-dark
+    gsettings set com.github.stunkymonkey.nautilus-open-any-terminal terminal ghostty 2>/dev/null
+    /usr/local/bin/fasd-outputs
+    touch "$M"
+fi
+[ -f "$HOME/.config/niri/colors.kdl" ] || : >"$HOME/.config/niri/colors.kdl"
+icons
+exit 0

@@ -1,0 +1,106 @@
+#!/bin/sh
+PB=/System/pkg-backend; [ -x "$PB" ] || PB=pacman
+exec 9>/run/fasd-apps.lock
+flock -n 9 || exit 0
+SL=/usr/share/fasdeqos/system.list
+ST=/var/lib/fasdeqos/layout.list
+mkdir -p /var/lib/fasdeqos /System/Index /System/Kernel /System/Frameworks /Applications/tui /Mount
+ln -sfn /usr/bin /System/Index/bin
+ln -sfn /usr/include /System/Index/include
+ln -sfn /usr/lib /System/Index/lib
+ln -sfn /usr/lib /System/Index/libexec
+ln -sfn /usr/share /System/Index/share
+ln -sfn /etc /System/Settings
+ln -sfn /var /System/Variable
+ln -sfn /usr/lib/modules /System/Kernel/Modules
+ln -sfn /boot /System/Kernel/Boot
+ln -sfn /dev /System/Kernel/Devices
+ln -sfn /sys /System/Kernel/Objects
+ln -sfn /proc /System/Kernel/Status
+[ -e /Users ] || ln -s /home /Users
+rmdir /mnt /srv /opt /home 2>/dev/null
+for fw in gtk3:GTK3 gtk4:GTK4 qt5-base:Qt5 qt6-base:Qt6 mesa:Mesa vulkan-icd-loader:Vulkan; do
+    p=${fw%%:*}
+    n=${fw##*:}
+    if "$PB" -Qq "$p" >/dev/null 2>&1; then
+        mkdir -p "/System/Frameworks/$n"
+        "$PB" -Q "$p" >"/System/Frameworks/$n/Info"
+        ln -sfn /usr/lib "/System/Frameworks/$n/lib"
+        ln -sfn /usr/include "/System/Frameworks/$n/include"
+        ln -sfn /usr/share "/System/Frameworks/$n/share"
+    else
+        rm -rf "/System/Frameworks/$n"
+    fi
+done
+printf '%s\n' bin boot dev etc home lib lib64 mnt opt proc root run sbin srv sys tmp usr var lost+found swapfile .snapshots efi >/.hidden
+U=$(awk -F: '$3 == 1000 {print $1; exit}' /etc/passwd)
+touch "$ST"
+if [ -x /usr/local/bin/FasdQuery ] && [ ! -d /Applications/FasdQuery.app ]; then
+    mkdir -p /Applications/FasdQuery.app/Contents
+    printf 'fasdquery\n' >/Applications/FasdQuery.app/Contents/Info
+    ln -sfn /usr/local/share/applications/fasdquery.desktop /Applications/FasdQuery.app/Contents/Desktop
+    ln -sfn /usr/local/bin/FasdQuery /Applications/FasdQuery.app/Contents/Executable
+    [ -n "$(awk -F: '$3 == 1000 {print $1; exit}' /etc/passwd)" ] && chown -R "$(awk -F: '$3 == 1000 {print $1; exit}' /etc/passwd):$(awk -F: '$3 == 1000 {print $1; exit}' /etc/passwd)" /Applications/FasdQuery.app
+fi
+WANT=$(mktemp)
+rm -rf /System/Packages /System/Kernels
+mkdir -p /System/Packages /System/Kernels /Applications/shells
+VERS=$(mktemp)
+"$PB" -Q >"$VERS"
+sysmark() {
+    mkdir -p "/System/Packages/$1"
+    awk -v n="$1" '$1 == n {print $1, $2}' "$VERS" >"/System/Packages/$1/Info"
+}
+kern() {
+    kd=/System/Kernels/$1
+    mkdir -p "$kd"
+    awk -v n="$1" '$1 == n {print $1, $2}' "$VERS" >"$kd/Info"
+    ln -sfn "/boot/vmlinuz-$1" "$kd/vmlinuz"
+    ln -sfn "/boot/initramfs-$1.img" "$kd/initramfs"
+    km=$("$PB" -Qlq "$1" 2>/dev/null | sed -n 's#^\(/usr/lib/modules/[^/]*\)/vmlinuz$#\1#p' | head -n 1)
+    [ -n "$km" ] && ln -sfn "$km" "$kd/Modules"
+}
+for p in $("$PB" -Qeq); do
+    if grep -qx "$p" "$SL" 2>/dev/null || grep -qx "$p" /etc/fasdeqos/system.local 2>/dev/null; then sysmark "$p"; continue; fi
+    case "$p" in linux|linux-lts|linux-zen|linux-rt|linux-rt-lts|linux-hardened|linux-mainline|linux-xanmod*|linux-cachyos*|linux-tkg*) kern "$p"; sysmark "$p"; continue ;; esac
+    case "$p" in linux|linux-*|*-headers|*-dkms|*-ucode|nvidia*|lib32-*|*-firmware|*-utils) sysmark "$p"; continue ;; esac
+    case "$p" in quickshell|noctalia*|waybar|dms|dms-*|dankmaterialshell*) shell=1; TB=/Applications/shells ;; *) shell=0; TB=/Applications/tui ;; esac
+    files=$("$PB" -Qlq "$p" 2>/dev/null)
+    desk=$(printf '%s\n' "$files" | grep '^/usr/share/applications/.*\.desktop$' | head -n 1)
+    ver=$("$PB" -Q "$p" | awk '{print $2}')
+    if [ -n "$desk" ] && [ "$shell" = 0 ]; then
+        name=$(sed -n 's/^Name=//p' "$desk" | head -n 1)
+        [ -n "$name" ] || name=$p
+        d="/Applications/$(printf '%s' "$name" | tr '/' '-').app"
+        if [ ! -d "$d" ]; then
+            mkdir -p "$d/Contents"
+            printf '%s %s\n' "$p" "$ver" >"$d/Contents/Info"
+            ln -sfn "$desk" "$d/Contents/Desktop"
+            ex=$(sed -n 's/^Exec=\([^ ]*\).*/\1/p' "$desk" | head -n 1)
+            [ -n "$ex" ] && [ -x "/usr/bin/$ex" ] && ln -sfn "/usr/bin/$ex" "$d/Contents/Executable"
+            [ -n "$U" ] && chown -R "$U:$U" "$d"
+        fi
+        printf '%s\t%s\n' "$d" "$p" >>"$WANT"
+    else
+        bins=$(printf '%s\n' "$files" | grep '^/usr/bin/[^/]*$')
+        [ -n "$bins" ] || continue
+        d="$TB/$p"
+        if [ ! -d "$d" ]; then
+            mkdir -p "$d"
+            printf '%s %s\n' "$p" "$ver" >"$d/Info"
+            for b in $bins; do
+                ln -sfn "$b" "$d/$(basename "$b")"
+            done
+            [ -n "$U" ] && chown -R "$U:$U" "$d"
+        fi
+        printf '%s\t%s\n' "$d" "$p" >>"$WANT"
+    fi
+done
+while IFS="	" read -r d p; do
+    [ -n "$d" ] || continue
+    grep -qF "$d	" "$WANT" || case "$d" in /Applications/*) rm -rf "$d" ;; esac
+done <"$ST"
+cat "$WANT" >"$ST"
+rm -f "$WANT" "$VERS"
+chmod 0777 /Applications /Applications/tui /Applications/shells
+exit 0

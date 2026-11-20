@@ -1,0 +1,162 @@
+#!/bin/bash
+[ "$(id -u)" = 0 ] || exec doas "$0" "$@"
+dmesg -n 1 2>/dev/null
+Z=$'\e[0m'; Y=$'\e[1;38;2;226;177;51m'; B=$'\e[1m'; D=$'\e[2m'; RD=$'\e[38;2;255;90;90m'; GR=$'\e[38;2;120;220;120m'
+banner() {
+    printf '\n  %sFasdeqOS%s  %sinstaller%s\n  %s----------------------------%s\n\n' "$Y" "$Z" "$D" "$Z" "$D" "$Z"
+}
+choose() {
+    local title=$1 i=0 n=${#OPTS[@]} k r j
+    printf '\e[?25l'
+    while :; do
+        clear
+        banner
+        printf '  %s%s%s\n\n' "$B" "$title" "$Z"
+        for j in "${!OPTS[@]}"; do
+            if [ "$j" = "$i" ]; then printf '  %s> %s%s\n' "$Y" "${OPTS[$j]}" "$Z"; else printf '    %s\n' "${OPTS[$j]}"; fi
+        done
+        printf '\n  %sUp/Down: move   Enter: select%s\n' "$D" "$Z"
+        IFS= read -rsn1 k
+        case "$k" in
+            $'\e')
+                read -rsn2 -t 0.05 r
+                case "$r" in
+                    '[A') [ "$i" -gt 0 ] && i=$((i - 1)) ;;
+                    '[B') [ "$i" -lt $((n - 1)) ] && i=$((i + 1)) ;;
+                esac ;;
+            k) [ "$i" -gt 0 ] && i=$((i - 1)) ;;
+            j) [ "$i" -lt $((n - 1)) ] && i=$((i + 1)) ;;
+            '') break ;;
+        esac
+    done
+    printf '\e[?25h'
+    CH=$i
+}
+multi() {
+    local title=$1 i=0 n=${#OPTS[@]} k r j
+    local -a ON=()
+    for j in "${!OPTS[@]}"; do ON[$j]=0; done
+    printf '\e[?25l'
+    while :; do
+        clear
+        banner
+        printf '  %s%s%s\n  %sEnglish (us) is always the first layout.%s\n\n' "$B" "$title" "$Z" "$D" "$Z"
+        for j in "${!OPTS[@]}"; do
+            m=' '; [ "${ON[$j]}" = 1 ] && m='x'
+            if [ "$j" = "$i" ]; then printf '  %s> [%s] %s%s\n' "$Y" "$m" "${OPTS[$j]}" "$Z"; else printf '    [%s] %s\n' "$m" "${OPTS[$j]}"; fi
+        done
+        printf '\n  %sUp/Down: move   Space: toggle   Enter: done%s\n' "$D" "$Z"
+        IFS= read -rsn1 k
+        case "$k" in
+            $'\e')
+                read -rsn2 -t 0.05 r
+                case "$r" in
+                    '[A') [ "$i" -gt 0 ] && i=$((i - 1)) ;;
+                    '[B') [ "$i" -lt $((n - 1)) ] && i=$((i + 1)) ;;
+                esac ;;
+            ' ') if [ "${ON[$i]}" = 1 ]; then ON[$i]=0; else ON[$i]=1; fi ;;
+            '') break ;;
+        esac
+    done
+    printf '\e[?25h'
+    CHS=""
+    for j in "${!OPTS[@]}"; do
+        [ "${ON[$j]}" = 1 ] && CHS="$CHS,${OPTS[$j]%% *}"
+    done
+    CHS=${CHS#,}
+}
+bars() {
+    local s=$1
+    if [ "$s" -ge 75 ]; then echo '||||'; elif [ "$s" -ge 50 ]; then echo '||| '; elif [ "$s" -ge 25 ]; then echo '||  '; else echo '|   '; fi
+}
+wifi_connect() {
+    local dev=$1 sig sec ssid pw line
+    nmcli radio wifi on >/dev/null 2>&1
+    while :; do
+        clear
+        banner
+        printf '  %sScanning Wi-Fi networks...%s\n' "$B" "$Z"
+        nmcli dev wifi rescan ifname "$dev" >/dev/null 2>&1
+        sleep 3
+        OPTS=()
+        SS=()
+        while IFS=: read -r sig sec ssid; do
+            ssid=${ssid//\\:/:}
+            [ -n "$ssid" ] || continue
+            printf '%s\n' "${SS[@]:-}" | grep -qxF "$ssid" && continue
+            SS+=("$ssid")
+            lock=open
+            [ -n "$sec" ] && [ "$sec" != "--" ] && lock=secured
+            OPTS+=("$(bars "$sig")  $(printf '%-32s' "$ssid") $lock")
+        done < <(nmcli -t -f SIGNAL,SECURITY,SSID dev wifi list ifname "$dev" | sort -t: -k1 -nr)
+        OPTS+=("Rescan" "Skip Wi-Fi")
+        choose "Choose a Wi-Fi network"
+        n=${#SS[@]}
+        [ "$CH" -eq "$n" ] && continue
+        [ "$CH" -gt "$n" ] && return 1
+        ssid=${SS[$CH]}
+        pw=""
+        if printf '%s' "${OPTS[$CH]}" | grep -q 'secured$'; then
+            clear
+            banner
+            printf '  %sNetwork:%s %s\n\n' "$B" "$Z" "$ssid"
+            read -rsp "  Password: " pw
+            echo
+        fi
+        printf '\n  Connecting...\n'
+        if [ -n "$pw" ]; then
+            nmcli dev wifi connect "$ssid" password "$pw" ifname "$dev" >/dev/null 2>&1
+        else
+            nmcli dev wifi connect "$ssid" ifname "$dev" >/dev/null 2>&1
+        fi
+        if [ $? -eq 0 ]; then
+            printf '  %sConnected to %s%s\n' "$GR" "$ssid" "$Z"
+            sleep 1
+            return 0
+        fi
+        printf '  %sCould not connect. Check the password and try again.%s\n' "$RD" "$Z"
+        sleep 2
+    done
+}
+systemctl start NetworkManager >/dev/null 2>&1
+clear
+banner
+printf '  %sLooking for network devices...%s\n' "$D" "$Z"
+for i in 1 2 3 4 5 6; do
+    nmcli -t -f TYPE dev 2>/dev/null | grep -q '^wifi$\|^ethernet$' && break
+    sleep 1
+done
+sleep 3
+ETH=$(nmcli -t -f DEVICE,TYPE,STATE dev | awk -F: '$2 == "ethernet" && $3 == "connected" {print $1; exit}')
+WIFI=$(nmcli -t -f DEVICE,TYPE dev | awk -F: '$2 == "wifi" {print $1; exit}')
+if [ -n "$ETH" ] && [ -n "$WIFI" ]; then
+    OPTS=("Ethernet ($ETH)" "Wi-Fi ($WIFI)")
+    choose "Both Ethernet and Wi-Fi are available. Which one to use?"
+    if [ "$CH" = 1 ]; then
+        nmcli dev disconnect "$ETH" >/dev/null 2>&1
+        wifi_connect "$WIFI"
+    else
+        nmcli dev disconnect "$WIFI" >/dev/null 2>&1
+    fi
+elif [ -z "$ETH" ] && [ -n "$WIFI" ]; then
+    wifi_connect "$WIFI"
+fi
+ok=0
+for i in 1 2 3 4 5 6 7 8; do
+    curl -fsS --max-time 4 -o /dev/null https://archlinux.org >/dev/null 2>&1 && { ok=1; break; }
+    sleep 1
+done
+if [ "$ok" = 0 ]; then
+    clear
+    banner
+    printf '  %sNo internet connection detected. The installer needs the network.%s\n' "$RD" "$Z"
+    sleep 3
+fi
+OPTS=("ru  Russian" "ua  Ukrainian" "by  Belarusian" "kz  Kazakh" "de  German" "fr  French" "es  Spanish" "it  Italian" "pl  Polish" "pt  Portuguese" "br  Portuguese (Brazil)" "tr  Turkish" "cz  Czech" "se  Swedish" "gr  Greek" "il  Hebrew" "ara Arabic")
+multi "Extra keyboard layouts"
+export FASD_KB=$CHS
+export FASDEQ_BACKEND=/usr/local/bin/fasdeq-install
+clear
+/usr/local/bin/fasdeq-installer && exit 0
+echo "The installer failed. Log: /tmp/fasdeq-install.log"
+exit 1

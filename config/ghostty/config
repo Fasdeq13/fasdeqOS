@@ -1,0 +1,8 @@
+window-decoration = none
+background-opacity = 0.95
+font-family = JetBrainsMono Nerd Font
+font-size = 11
+window-padding-x = 8
+window-padding-y = 8
+theme = Catppuccin Mocha
+confirm-close-surface = false

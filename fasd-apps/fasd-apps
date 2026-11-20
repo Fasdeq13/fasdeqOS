@@ -1,0 +1,88 @@
+#!/bin/sh
+PB=/System/pkg-backend; [ -x "$PB" ] || PB=pacman
+D=/Applications
+ST=/var/lib/fasdeqos/apps.list
+AD=/usr/local/share/applications
+ID=/usr/local/share/fasdeqos/icons
+mkdir -p "$D/tui" /var/lib/fasdeqos "$AD" "$ID"
+touch "$ST"
+LS=/var/lib/fasdeqos/layout.list
+if [ -d "$D" ] && [ -f "$LS" ]; then
+    MISS=$(mktemp)
+    while IFS="	" read -r d p; do
+        [ -n "$d" ] && [ ! -e "$d" ] && echo "$p" >>"$MISS"
+    done <"$LS"
+    if [ -s "$MISS" ] && [ "$(wc -l <"$MISS")" -le 2 ]; then
+        while IFS= read -r p; do
+            "$PB" -Rns --noconfirm "$p" >/dev/null 2>&1
+        done <"$MISS"
+    fi
+    rm -f "$MISS"
+fi
+NOW=$(mktemp)
+find "$D" -type f \( -iname '*.appimage' -o -name '*.pkg.tar.zst' \) | sort >"$NOW"
+slug() { basename "$1" | sed 's/\.[Aa]pp[Ii]mage$//;s/\.pkg\.tar\.zst$//' | tr -c 'A-Za-z0-9._\n-' '-' | tr 'A-Z' 'a-z'; }
+record() { printf '%s\t%s\t%s\n' "$1" "$2" "$3" >>"$ST"; }
+add_appimage() {
+    f=$1
+    chmod +x "$f"
+    s=$(slug "$f")
+    t=$(mktemp -d)
+    ( cd "$t" && "$f" --appimage-extract '*.desktop' >/dev/null 2>&1; "$f" --appimage-extract '.DirIcon' >/dev/null 2>&1 )
+    src=$(ls "$t"/squashfs-root/*.desktop 2>/dev/null | head -n 1)
+    name=$s
+    cat=Utility
+    [ -n "$src" ] && { n=$(sed -n 's/^Name=//p' "$src" | head -n 1); [ -n "$n" ] && name=$n; c=$(sed -n 's/^Categories=//p' "$src" | head -n 1); [ -n "$c" ] && cat=$c; }
+    icon=application-x-executable
+    if [ -e "$t/squashfs-root/.DirIcon" ]; then
+        cp -L "$t/squashfs-root/.DirIcon" "$ID/$s.png" 2>/dev/null && icon=$ID/$s.png
+    fi
+    term=false
+    case "$f" in "$D"/tui/*) term=true ;; esac
+    {
+        echo "[Desktop Entry]"
+        echo "Type=Application"
+        echo "Name=$name"
+        echo "Exec=\"$f\" %U"
+        echo "Icon=$icon"
+        echo "Terminal=$term"
+        echo "Categories=$cat;"
+    } >"$AD/fasd-$s.desktop"
+    rm -rf "$t"
+    record "$f" appimage "$s"
+}
+add_pkg() {
+    f=$1
+    id=$("$PB" -Qp "$f" 2>/dev/null | awk '{print $1}')
+    [ -n "$id" ] || return 0
+    case "$f" in
+        "$D"/tui/*) ;;
+        *) bsdtar -tf "$f" 2>/dev/null | grep -q 'usr/share/applications/.*\.desktop$' || { mv "$f" "$D/tui/" && f=$D/tui/$(basename "$f"); } ;;
+    esac
+    "$PB" -U --noconfirm --needed "$f" >/dev/null 2>&1 || return 0
+    record "$f" pkg "$id"
+}
+while IFS= read -r f; do
+    grep -qF "$f	" "$ST" && continue
+    case "$f" in
+        *.pkg.tar.zst) add_pkg "$f" ;;
+        *) add_appimage "$f" ;;
+    esac
+done <"$NOW"
+find "$D" -type f \( -iname '*.appimage' -o -name '*.pkg.tar.zst' \) | sort >"$NOW"
+OLD=$(mktemp)
+cp "$ST" "$OLD"
+: >"$ST"
+while IFS="	" read -r f kind id; do
+    if grep -qxF "$f" "$NOW"; then
+        printf '%s\t%s\t%s\n' "$f" "$kind" "$id" >>"$ST"
+    else
+        case "$kind" in
+            appimage) rm -f "$AD/fasd-$id.desktop" "$ID/$id.png" ;;
+            pkg) "$PB" -Rns --noconfirm "$id" >/dev/null 2>&1 ;;
+        esac
+    fi
+done <"$OLD"
+rm -f "$NOW" "$OLD"
+update-desktop-database "$AD" >/dev/null 2>&1 || true
+exit 0

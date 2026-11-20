@@ -1,0 +1,101 @@
+format = """
+[](fg:bg1)\
+$username\
+[](bg:bg2 fg:bg1)\
+$directory\
+[](bg:bg3 fg:bg2)\
+$git_branch\
+$git_status\
+[](bg:bg4 fg:bg3)\
+$c$rust$golang$nodejs$php$java$python\
+[](fg:bg4)\
+$cmd_duration\
+$line_break\
+$character"""
+
+palette = 'fasd'
+
+[palettes.fasd]
+bg1 = '#151515'
+bg2 = '#202020'
+bg3 = '#2b2b2b'
+bg4 = '#383838'
+fg = '#e6e6e6'
+dim = '#8a8a8a'
+ok = '#6ee7a0'
+err = '#ff5449'
+
+[username]
+show_always = true
+style_user = 'bg:bg1 fg:fg'
+style_root = 'bg:bg1 fg:err'
+format = '[ $user ]($style)'
+
+[directory]
+style = 'bg:bg2 fg:fg'
+format = '[ $path ]($style)'
+truncation_length = 3
+truncation_symbol = '…/'
+
+[directory.substitutions]
+'Documents' = '󰈙 '
+'Downloads' = ' '
+'Music' = '󰝚 '
+'Pictures' = ' '
+
+[git_branch]
+symbol = ''
+style = 'bg:bg3 fg:fg'
+format = '[ $symbol $branch ]($style)'
+
+[git_status]
+style = 'bg:bg3 fg:dim'
+format = '[$all_status$ahead_behind ]($style)'
+
+[nodejs]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[c]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[rust]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[golang]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[php]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[java]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[python]
+symbol = ''
+style = 'bg:bg4 fg:fg'
+format = '[ $symbol( $version) ]($style)'
+
+[cmd_duration]
+min_time = 2000
+style = 'fg:dim'
+format = '[ $duration]($style)'
+
+[character]
+success_symbol = '[❯](bold fg:ok)'
+error_symbol = '[❯](bold fg:err)'
+vimcmd_symbol = '[❮](bold fg:ok)'
+
+[os]
+disabled = true

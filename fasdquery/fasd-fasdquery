@@ -1,0 +1,20 @@
+#!/bin/sh
+PB=/System/pkg-backend; [ -x "$PB" ] || PB=pacman
+[ "$(id -u)" = 0 ] || exec doas "$0" "$@"
+T=$(mktemp -d)
+"$PB" -S --needed --asdeps --noconfirm cmake ninja gcc qt6-svg git >/dev/null 2>&1
+if git clone --depth 1 https://github.com/Fasdeq13/FasdQuery.git "$T/src" >/dev/null 2>&1 \
+    && cmake -S "$T/src" -B "$T/b" -G Ninja -DCMAKE_BUILD_TYPE=Release >/dev/null 2>&1 \
+    && ninja -C "$T/b" >/dev/null 2>&1; then
+    install -Dm755 "$T/b/FasdQuery" /usr/local/bin/FasdQuery
+    install -Dm644 "$T/src/app_icon.svg" /usr/share/icons/hicolor/scalable/apps/fasdquery.svg
+    mkdir -p /usr/local/share/applications
+    printf '[Desktop Entry]\nType=Application\nName=FasdQuery\nComment=File search\nExec=/usr/local/bin/FasdQuery\nIcon=fasdquery\nCategories=Utility;\nTerminal=false\n' >/usr/local/share/applications/fasdquery.desktop
+    gtk-update-icon-cache -f /usr/share/icons/hicolor >/dev/null 2>&1
+    /usr/local/bin/fasd-layout
+    rm -rf "$T"
+    exit 0
+fi
+rm -rf "$T"
+echo "FasdQuery was not built"
+exit 1

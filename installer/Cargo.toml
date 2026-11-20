@@ -1,0 +1,17 @@
+[package]
+name = "fasdeq-installer"
+version = "0.5.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[dependencies]
+ratatui = "0.30"
+sha-crypt = "0.5"
+unicode-width = "0.2"
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+codegen-units = 1
+panic = "abort"

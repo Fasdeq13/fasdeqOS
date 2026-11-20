@@ -1,0 +1,32 @@
+#!/bin/sh
+PB=/System/pkg-backend; [ -x "$PB" ] || PB=pacman
+c=${1:-}
+OW='/usr/share/applications/*,/usr/share/icons/*,/etc/grub.d/*,/etc/ostree*'
+[ $# -gt 0 ] && shift
+SYS=0
+if [ "${1:-}" = --system ]; then SYS=1; shift; fi
+case $c in
+    install|add)
+        EXTRA=""
+        for a in "$@"; do
+            case "$a" in linux-lts|linux-zen|linux-rt|linux-rt-lts|linux-hardened|linux-mainline) [ -x /usr/bin/dkms ] && EXTRA="$EXTRA $a-headers" ;; esac
+        done
+        set -- -S --needed --overwrite "$OW" "$@" $EXTRA
+        R=1 ;;
+    remove|delete) set -- -Rns "$@"; R=1 ;;
+    update) set -- -Sy; R=1 ;;
+    upgrade) exec doas /usr/local/bin/fasd-upgrade ;;
+    sysupgrade) set -- -Syu --overwrite "$OW" "$@"; R=1 ;;
+    search) set -- -Ss "$@"; R=0 ;;
+    list) set -- -Qe; R=0 ;;
+    info) set -- -Si "$@"; R=0 ;;
+    rebuild) exec doas dkms autoinstall ;;
+    *) echo "usage: pkg install [--system]|remove|update|upgrade|sysupgrade|search|list|info|rebuild"; exit 1 ;;
+esac
+if [ "$SYS" = 1 ] && [ "$c" = install -o "$c" = add ]; then
+    NAMES=""
+    for a in "$@"; do case "$a" in -*|/*) ;; *) NAMES="$NAMES $a" ;; esac; done
+    doas sh -c 'mkdir -p /etc/fasdeqos; for n; do grep -qx "$n" /etc/fasdeqos/system.local 2>/dev/null || echo "$n" >>/etc/fasdeqos/system.local; done' sh $NAMES
+fi
+if [ "$R" = 1 ] && [ "$(id -u)" != 0 ]; then exec doas "$PB" "$@"; fi
+exec "$PB" "$@"

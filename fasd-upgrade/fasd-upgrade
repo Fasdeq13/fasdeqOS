@@ -1,0 +1,33 @@
+#!/bin/sh
+[ "$(id -u)" = 0 ] || exec doas "$0" "$@"
+. /etc/fasdeqos/repo.conf 2>/dev/null
+[ -n "${REPO:-}" ] || { echo "no repository configured"; exit 1; }
+T=$(mktemp)
+got=0
+for b in ${BRANCH:-main} master; do
+    if curl -fsSL --max-time 30 -H 'Cache-Control: no-cache' "https://raw.githubusercontent.com/$REPO/$b/update.sh" -o "$T"; then
+        got=1
+        break
+    fi
+done
+if [ "$got" != 1 ]; then
+    echo "cannot download update.sh from github.com/$REPO"
+    rm -f "$T"
+    exit 1
+fi
+N=$(sha256sum "$T" | cut -d' ' -f1)
+O=$(cat /var/lib/fasdeqos/update.sha256 2>/dev/null)
+if [ "$N" = "$O" ]; then
+    echo "FasdeqOS is up to date"
+    rm -f "$T"
+    exit 0
+fi
+mkdir -p /var/lib/fasdeqos
+if bash "$T"; then
+    printf '%s\n' "$N" >/var/lib/fasdeqos/update.sha256
+    rm -f "$T"
+    exit 0
+fi
+echo "update failed"
+rm -f "$T"
+exit 1

@@ -1,0 +1,75 @@
+#!/bin/sh
+case "${LC_ALL:-${LANG:-en}}" in
+    ru*) T1="fastab: выбор дисков для автомонтирования"; T2="Стрелки: выбор   Пробел: отметить   o: параметры   Enter: применить   q: выход"; T3="Нет дисков, которых нет в fstab"; T4="Параметры монтирования (пусто = defaults): "; T5="Готово. Диски смонтируются при следующей загрузке."; T6="Нужен root"; T7="Применено";;
+    uk*) T1="fastab: вибір дисків для автомонтування"; T2="Стрілки: вибір   Пробіл: позначити   o: параметри   Enter: застосувати   q: вихід"; T3="Немає дисків, яких нема у fstab"; T4="Параметри монтування (порожньо = defaults): "; T5="Готово. Диски змонтуються при наступному завантаженні."; T6="Потрібен root"; T7="Застосовано";;
+    *) T1="fastab: pick disks to mount at boot"; T2="Arrows: move   Space: toggle   o: options   Enter: apply   q: quit"; T3="No disks missing from fstab"; T4="Mount options (empty = defaults): "; T5="Done. Disks will be mounted on next boot."; T6="Root required"; T7="Applied";;
+esac
+[ "$(id -u)" = 0 ] || exec doas /usr/local/bin/fastab "$@"
+FSTAB=/etc/fstab
+LIST=$(mktemp)
+blkid | while IFS= read -r l; do
+    dev=${l%%:*}
+    uuid=$(echo "$l" | sed -n 's/.* UUID="\([^"]*\)".*/\1/p')
+    typ=$(echo "$l" | sed -n 's/.* TYPE="\([^"]*\)".*/\1/p')
+    lab=$(echo "$l" | sed -n 's/.* LABEL="\([^"]*\)".*/\1/p')
+    case "$typ" in ext4|ext3|ext2|btrfs|vfat|xfs|f2fs|exfat|ntfs) ;; *) continue;; esac
+    [ -n "$uuid" ] || continue
+    grep -q "$uuid" "$FSTAB" 2>/dev/null && continue
+    cm=$(findmnt -rno TARGET "$dev" 2>/dev/null | head -n 1)
+    case "$cm" in /|/boot|/boot/*|/efi|/Users) continue ;; esac
+    sz=$(awk -v d="${dev#/dev/}" '$4 == d {printf "%.1fG", $3/1048576}' /proc/partitions)
+    echo "$dev|$uuid|$typ|${lab:-${dev#/dev/}}|$sz|defaults,nofail,x-gvfs-show|0" >>"$LIST"
+done
+N=$(wc -l <"$LIST")
+[ "$N" -gt 0 ] || { echo "$T3"; rm -f "$LIST"; exit 0; }
+OLD=$(stty -g)
+trap 'stty "$OLD"; rm -f "$LIST"; printf "\033[?25h"' EXIT INT TERM
+stty -icanon -echo min 1 time 0
+cur=1
+draw() {
+    printf '\033[H\033[2J\033[1m%s\033[0m\n%s\n\n' "$T1" "$T2"
+    i=1
+    while IFS='|' read -r dev uuid typ lab sz opt sel; do
+        m=" "; [ "$sel" = 1 ] && m="x"
+        p="  "; [ "$i" = "$cur" ] && p="> "
+        [ "$i" = "$cur" ] && printf '\033[7m'
+        printf '%s[%s] %-12s %-6s %-8s %-16s %s\033[0m\n' "$p" "$m" "$dev" "$typ" "$sz" "$lab" "$opt"
+        i=$((i+1))
+    done <"$LIST"
+}
+setfield() {
+    awk -F'|' -v OFS='|' -v n="$1" -v f="$2" -v v="$3" 'NR == n {$f = v} {print}' "$LIST" >"$LIST.n" && cat "$LIST.n" >"$LIST"; rm -f "$LIST.n"
+}
+getfield() { sed -n "${1}p" "$LIST" | cut -d'|' -f"$2"; }
+printf '\033[?25l'
+while :; do
+    draw
+    k=$(dd bs=1 count=1 2>/dev/null)
+    case "$k" in
+        q) exit 0;;
+        " ") s=$(getfield "$cur" 7); [ "$s" = 1 ] && s=0 || s=1; setfield "$cur" 7 "$s";;
+        o) printf '\033[?25h\n%s' "$T4"; stty "$OLD"; read -r o; stty -icanon -echo min 1 time 0; printf '\033[?25l'; [ -n "$o" ] || o=defaults; case "$o" in *x-gvfs-show*) ;; *) o="$o,nofail,x-gvfs-show" ;; esac; setfield "$cur" 6 "$o";;
+        j) [ "$cur" -lt "$N" ] && cur=$((cur+1));;
+        k) [ "$cur" -gt 1 ] && cur=$((cur-1));;
+        "$(printf '\n')"|"")
+            while IFS='|' read -r dev uuid typ lab sz opt sel; do
+                [ "$sel" = 1 ] || continue
+                mp="/Mount/$(echo "$lab" | tr ' /' '__')"
+                mkdir -p "$mp"
+                umount "$dev" 2>/dev/null
+                [ "$typ" = ntfs ] && typ=ntfs3
+                pass=2; [ "$typ" = vfat ] || [ "$typ" = exfat ] && pass=0
+                echo "UUID=$uuid $mp $typ $opt 0 $pass" >>"$FSTAB"
+                mount "$mp" 2>/dev/null
+                case "$typ" in ext4|ext3|ext2|btrfs|xfs|f2fs) [ "$(stat -c %u "$mp")" = 0 ] && chown 1000:1000 "$mp" ;; esac
+            done <"$LIST"
+            printf '\033[H\033[2J%s\n' "$T5"
+            exit 0;;
+        "$(printf '\033')")
+            r=$(dd bs=1 count=2 2>/dev/null)
+            case "$r" in
+                "[A") [ "$cur" -gt 1 ] && cur=$((cur-1));;
+                "[B") [ "$cur" -lt "$N" ] && cur=$((cur+1));;
+            esac;;
+    esac
+done

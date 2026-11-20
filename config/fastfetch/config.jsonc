@@ -1,0 +1,21 @@
+{
+  "logo": { "type": "file-raw", "source": "/usr/share/fasdeqos/logo.ansi", "padding": { "top": 1, "right": 3 } },
+  "display": { "separator": "  ", "color": { "keys": "yellow", "title": "yellow" } },
+  "modules": [
+    "title",
+    "separator",
+    { "type": "os", "key": " OS", "format": "{name}" },
+    { "type": "kernel", "key": " Kernel" },
+    { "type": "uptime", "key": " Uptime" },
+    { "type": "packages", "key": " Packages", "format": "{all}" },
+    { "type": "shell", "key": " Shell" },
+    { "type": "wm", "key": " WM" },
+    { "type": "terminal", "key": " Terminal" },
+    { "type": "cpu", "key": " CPU" },
+    { "type": "gpu", "key": " GPU" },
+    { "type": "memory", "key": " Memory" },
+    { "type": "disk", "key": " Disk", "folders": "/" },
+    "break",
+    "colors"
+  ]
+}

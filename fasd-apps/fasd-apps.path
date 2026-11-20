@@ -1,0 +1,8 @@
+[Unit]
+Description=Watch /Applications
+[Path]
+PathChanged=/Applications
+PathChanged=/Applications/tui
+PathChanged=/Applications/shells
+[Install]
+WantedBy=multi-user.target

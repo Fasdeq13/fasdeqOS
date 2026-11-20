@@ -1,0 +1,8 @@
+[Unit]
+Description=FasdeqOS application integration
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/flock /run/fasd-apps.lock /usr/local/bin/fasd-apps
+ExecStartPost=/usr/local/bin/fasd-layout
+[Install]
+WantedBy=multi-user.target
